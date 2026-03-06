@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Junk Unsubscriber</title>
+  <script src="https://alcdn.msauth.net/browser/2.38.3/js/msal-browser.min.js"></script>
+  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', sans-serif; font-size: 13px; color: #201f1e; background: #faf9f8; }
+    header { background: #0078d4; color: white; padding: 10px 14px; display: flex; align-items: center; gap: 8px; }
+    header h1 { font-size: 14px; font-weight: 600; }
+    header p { font-size: 11px; opacity: 0.85; }
+    .warning { background: #fff4ce; border-left: 3px solid #f2c94c; padding: 8px 12px; margin: 10px; font-size: 11px; color: #5d4b00; }
+    .btn-primary { display: block; width: calc(100% - 20px); margin: 10px; padding: 10px; background: #0078d4; color: white; border: none; border-radius: 4px; font-size: 13px; font-weight: 600; cursor: pointer; }
+    .btn-primary:hover { background: #106ebe; }
+    .btn-primary:disabled { background: #c8c6c4; cursor: not-allowed; }
+    #status { margin: 0 10px 8px; font-size: 12px; color: #605e5c; min-height: 18px; }
+    #results { margin: 0 10px; }
+    .email-item { background: white; border: 1px solid #edebe9; border-radius: 4px; padding: 10px; margin-bottom: 8px; display: flex; align-items: flex-start; gap: 8px; }
+    .email-item input[type=checkbox] { margin-top: 2px; flex-shrink: 0; }
+    .email-info { flex: 1; overflow: hidden; }
+    .email-sender { font-weight: 600; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .email-subject { font-size: 11px; color: #605e5c; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .action-bar { display: flex; gap: 8px; margin: 10px; }
+    .btn-secondary { flex: 1; padding: 8px; background: white; color: #0078d4; border: 1px solid #0078d4; border-radius: 4px; font-size: 12px; cursor: pointer; font-weight: 600; }
+    .btn-secondary:hover { background: #deecf9; }
+    .btn-danger { flex: 1; padding: 8px; background: #d13438; color: white; border: none; border-radius: 4px; font-size: 12px; cursor: pointer; font-weight: 600; }
+    .btn-danger:hover { background: #a4262c; }
+    .count-badge { background: #0078d4; color: white; border-radius: 10px; padding: 1px 7px; font-size: 11px; margin-left: 6px; }
+    #select-all-bar { display: flex; align-items: center; margin: 0 10px 8px; gap: 6px; font-size: 12px; color: #605e5c; }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>🗑️ Junk Unsubscriber</h1>
+    <p>Désinscription des newsletters — Dossier Junk</p>
+  </div>
+</header>
+
+<div class="warning">
+  ⚠️ <strong>Conseil sécurité :</strong> Décochez les emails dont vous ne reconnaissez pas l'expéditeur. Se désinscrire d'un vrai spam peut confirmer votre adresse.
+</div>
+
+<button class="btn-primary" id="btn-scan">🔍 Scanner le dossier Junk</button>
+<div id="status"></div>
+
+<div id="results-container" class="hidden">
+  <div id="select-all-bar">
+    <input type="checkbox" id="select-all"/> <label for="select-all">Tout sélectionner</label>
+    <span id="count-label"></span>
+  </div>
+  <div id="results"></div>
+  <div class="action-bar">
+    <button class="btn-secondary" id="btn-unsub">🔗 Se désinscrire</button>
+    <button class="btn-danger" id="btn-delete">🗑️ Supprimer sélectionnés</button>
+  </div>
+</div>
+
+<script>
+const CLIENT_ID = "89bd4984-6324-4be4-b691-5d74abeff00f";
+const TENANT_ID = "e17efbb0-97d0-40a5-8d1c-3332042e21c0";
+const REDIRECT_URI = "https://rise-4.github.io/junk-unsubscriber/JunkUnsubscriber_taskpane.html";
+
+const msalConfig = {
+  auth: {
+    clientId: CLIENT_ID,
+    authority: "https://login.microsoftonline.com/" + TENANT_ID,
+    redirectUri: REDIRECT_URI,
+    navigateToLoginRequestUrl: false
+  },
+  cache: { cacheLocation: "sessionStorage", storeAuthStateInCookie: false }
+};
+
+const msalInstance = new msal.PublicClientApplication(msalConfig);
+const scopes = ["Mail.ReadWrite"];
+let foundEmails = [];
+
+async function getToken() {
+  await msalInstance.initialize();
+  const accounts = msalInstance.getAllAccounts();
+  if (accounts.length > 0) {
+    try {
+      const result = await msalInstance.acquireTokenSilent({ scopes, account: accounts[0] });
+      return result.accessToken;
+    } catch (e) {}
+  }
+  const result = await msalInstance.acquireTokenPopup({ scopes });
+  return result.accessToken;
+}
+
+async function callGraph(url, method = "GET", body = null, token) {
+  const opts = {
+    method,
+    headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" }
+  };
+  if (body) opts.body = JSON.stringify(body);
+  const res = await fetch(url, opts);
+  if (!res.ok) throw new Error(await res.text());
+  if (method === "DELETE" || res.status === 204) return null;
+  return res.json();
+}
+
+function extractUnsubscribeUrl(headers) {
+  const header = headers.find(h => h.name.toLowerCase() === "list-unsubscribe");
+  if (!header) return null;
+  const match = header.value.match(/<(https?:\/\/[^>]+)>/i);
+  return match ? match[1] : null;
+}
+
+function setStatus(msg) {
+  document.getElementById("status").textContent = msg;
+}
+
+document.getElementById("btn-scan").addEventListener("click", async () => {
+  const btn = document.getElementById("btn-scan");
+  btn.disabled = true;
+  setStatus("Connexion en cours...");
+  document.getElementById("results-container").classList.add("hidden");
+  document.getElementById("results").innerHTML = "";
+  foundEmails = [];
+
+  try {
+    const token = await getToken();
+    setStatus("Scan du dossier Junk...");
+
+    let url = "https://graph.microsoft.com/v1.0/me/mailFolders/junkemail/messages?$top=50&$select=id,subject,from,internetMessageHeaders&$expand=singleValueExtendedProperties($filter=id eq 'String 0x0070')";
+    const data = await callGraph(url, "GET", null, token);
+
+    if (!data || !data.value || data.value.length === 0) {
+      setStatus("✅ Dossier Junk vide ou aucun email trouvé.");
+      btn.disabled = false;
+      return;
+    }
+
+    for (const msg of data.value) {
+      const headers = msg.internetMessageHeaders || [];
+      const unsubUrl = extractUnsubscribeUrl(headers);
+      if (unsubUrl) {
+        foundEmails.push({
+          id: msg.id,
+          subject: msg.subject || "(sans objet)",
+          sender: msg.from?.emailAddress?.name || msg.from?.emailAddress?.address || "Inconnu",
+          unsubUrl
+        });
+      }
+    }
+
+    if (foundEmails.length === 0) {
+      setStatus("✅ Aucune newsletter détectée dans le dossier Junk.");
+      btn.disabled = false;
+      return;
+    }
+
+    setStatus("");
+    renderResults();
+    document.getElementById("results-container").classList.remove("hidden");
+
+  } catch (err) {
+    setStatus("❌ Erreur : " + err.message);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+function renderResults() {
+  const container = document.getElementById("results");
+  container.innerHTML = "";
+  const label = document.getElementById("count-label");
+  label.innerHTML = `<span class="count-badge">${foundEmails.length}</span> newsletter(s) trouvée(s)`;
+
+  foundEmails.forEach((email, i) => {
+    const div = document.createElement("div");
+    div.className = "email-item";
+    div.innerHTML = `
+      <input type="checkbox" class="email-checkbox" data-index="${i}" checked/>
+      <div class="email-info">
+        <div class="email-sender">${escHtml(email.sender)}</div>
+        <div class="email-subject">${escHtml(email.subject)}</div>
+      </div>`;
+    container.appendChild(div);
+  });
+}
+
+document.getElementById("select-all").addEventListener("change", function() {
+  document.querySelectorAll(".email-checkbox").forEach(cb => cb.checked = this.checked);
+});
+
+document.getElementById("btn-unsub").addEventListener("click", () => {
+  const checked = getChecked();
+  if (checked.length === 0) { setStatus("Sélectionnez au moins un email."); return; }
+  checked.forEach(i => window.open(foundEmails[i].unsubUrl, "_blank"));
+  setStatus(`🔗 ${checked.length} page(s) de désinscription ouvertes.`);
+});
+
+document.getElementById("btn-delete").addEventListener("click", async () => {
+  const checked = getChecked();
+  if (checked.length === 0) { setStatus("Sélectionnez au moins un email."); return; }
+
+  const btn = document.getElementById("btn-delete");
+  btn.disabled = true;
+  setStatus("Suppression en cours...");
+
+  try {
+    const token = await getToken();
+    let ok = 0;
+    for (const i of checked) {
+      try {
+        await callGraph(`https://graph.microsoft.com/v1.0/me/messages/${foundEmails[i].id}`, "DELETE", null, token);
+        ok++;
+      } catch (e) {}
+    }
+    foundEmails = foundEmails.filter((_, i) => !checked.includes(i));
+    setStatus(`✅ ${ok} email(s) supprimé(s).`);
+    if (foundEmails.length === 0) {
+      document.getElementById("results-container").classList.add("hidden");
+    } else {
+      renderResults();
+    }
+  } catch (err) {
+    setStatus("❌ Erreur : " + err.message);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+function getChecked() {
+  return [...document.querySelectorAll(".email-checkbox:checked")].map(cb => parseInt(cb.dataset.index));
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+
+Office.onReady(() => {});
+</script>
+</body>
+</html>
