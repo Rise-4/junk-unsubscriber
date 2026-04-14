@@ -106,12 +106,18 @@ function toggleDebug() {
 // CONFIG
 // ============================================================
 const CLIENT_ID = "89bd4984-6324-4be4-b691-5d74abeff00f";
-const TENANT_ID = "e17efbb0-97d0-40a5-8d1c-3332042e21c0";
+// FIX MULTI-TENANT : on n'utilise plus le TENANT_ID Rise comme authority.
+// Chaque utilisateur s'authentifie sur SON propre tenant (mantu, dxc, etc.)
+// et accède à SA propre boîte mail via Graph. L'endpoint "organizations"
+// accepte tous les comptes M365 professionnels sans forcer le tenant Rise.
+// Prérequis Azure : l'app doit être passée en AzureADMultipleOrgs.
+const AUTHORITY = "https://login.microsoftonline.com/organizations";
 const REDIRECT_URI = "https://rise-4.github.io/junk-unsubscriber/JunkUnsubscriber_taskpane.html";
 const GRAPH_SCOPES = ["Mail.ReadWrite"];
 
 dbg("Page chargée — Config OK");
 dbg(`Client ID: ${CLIENT_ID}`);
+dbg(`Authority: ${AUTHORITY}`);
 dbg(`Redirect URI: ${REDIRECT_URI}`);
 
 // ============================================================
@@ -128,7 +134,7 @@ let msalReady = false;
 const msalConfig = {
   auth: {
     clientId: CLIENT_ID,
-    authority: `https://login.microsoftonline.com/${TENANT_ID}`,
+    authority: AUTHORITY,
     redirectUri: REDIRECT_URI,
     navigateToLoginRequestUrl: false
   },
