@@ -141,8 +141,11 @@ const msalConfig = {
     navigateToLoginRequestUrl: false
   },
   cache: {
+    // memoryStorage : sessionStorage/localStorage bloqués dans l'iframe sandboxée Office.
+    // storeAuthStateInCookie: true permet au flow acquireTokenRedirect de survivre
+    // au rechargement de page (nonce/PKCE stockés en cookie, pas en mémoire).
     cacheLocation: "memoryStorage",
-    storeAuthStateInCookie: false
+    storeAuthStateInCookie: true
   },
   system: {
     loggerOptions: {
@@ -218,7 +221,10 @@ async function getToken() {
     if (popupErr.message && (
       popupErr.message.includes("popup_window_error") ||
       popupErr.message.includes("monitor_window_timeout") ||
-      popupErr.message.includes("block")
+      popupErr.message.includes("block") ||
+      popupErr.message.includes("popup_blocked") ||
+      popupErr.errorCode === "popup_window_error" ||
+      popupErr.errorCode === "monitor_window_timeout"
     )) {
       dbg("Popup bloqué — fallback vers acquireTokenRedirect...", "warn");
       await msalInstance.acquireTokenRedirect({ scopes: GRAPH_SCOPES });
