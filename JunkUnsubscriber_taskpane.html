@@ -11,9 +11,18 @@
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: 'Segoe UI', sans-serif; font-size: 13px; color: #201f1e; background: #faf9f8; }
-    header { background: #0078d4; color: white; padding: 10px 14px; display: flex; align-items: center; gap: 8px; }
-    header h1 { font-size: 14px; font-weight: 600; }
-    header p { font-size: 11px; opacity: 0.85; }
+
+    /* Header + debug toggle discret intégré */
+    header { background: #0078d4; color: white; padding: 10px 14px 6px; display: flex; align-items: flex-start; justify-content: space-between; }
+    header .header-text h1 { font-size: 14px; font-weight: 600; }
+    header .header-text p { font-size: 11px; opacity: 0.85; margin-top: 1px; }
+    #debug-toggle {
+      background: none; border: none; color: rgba(255,255,255,0.35); font-size: 9px;
+      cursor: pointer; padding: 0; margin-top: 2px; line-height: 1;
+      letter-spacing: 0.5px; text-transform: uppercase; font-family: 'Segoe UI', sans-serif;
+    }
+    #debug-toggle:hover { color: rgba(255,255,255,0.8); }
+
     .warning { background: #fff4ce; border-left: 3px solid #f2c94c; padding: 8px 12px; margin: 10px; font-size: 11px; color: #5d4b00; }
     .btn-primary { display: block; width: calc(100% - 20px); margin: 10px; padding: 10px; background: #0078d4; color: white; border: none; border-radius: 4px; font-size: 13px; font-weight: 600; cursor: pointer; }
     .btn-primary:hover { background: #106ebe; }
@@ -26,6 +35,9 @@
     .email-sender { font-weight: 600; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .email-subject { font-size: 11px; color: #605e5c; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .email-unsub { font-size: 10px; color: #0078d4; word-break: break-all; margin-top: 2px; }
+    .folder-badge { display: inline-block; font-size: 9px; font-weight: 600; padding: 1px 5px; border-radius: 3px; margin-right: 4px; vertical-align: middle; }
+    .folder-badge.junk { background: #fde7e9; color: #a4262c; }
+    .folder-badge.inbox { background: #dff6dd; color: #107c10; }
     .action-bar { display: flex; gap: 8px; margin: 10px; }
     .btn-secondary { flex: 1; padding: 8px; background: white; color: #0078d4; border: 1px solid #0078d4; border-radius: 4px; font-size: 12px; cursor: pointer; font-weight: 600; }
     .btn-secondary:hover { background: #deecf9; }
@@ -36,9 +48,7 @@
     .hidden { display: none !important; }
 
     /* Debug panel */
-    #debug-toggle { position: fixed; bottom: 8px; right: 8px; background: #605e5c; color: white; border: none; border-radius: 3px; padding: 3px 8px; font-size: 10px; cursor: pointer; z-index: 999; opacity: 0.7; }
-    #debug-toggle:hover { opacity: 1; }
-    #debug-panel { display: none; position: fixed; bottom: 32px; left: 0; right: 0; max-height: 40vh; background: #1e1e1e; color: #d4d4d4; font-family: 'Consolas', 'Courier New', monospace; font-size: 10px; overflow-y: auto; padding: 8px; z-index: 998; border-top: 2px solid #0078d4; }
+    #debug-panel { display: none; position: fixed; bottom: 0; left: 0; right: 0; max-height: 40vh; background: #1e1e1e; color: #d4d4d4; font-family: 'Consolas', 'Courier New', monospace; font-size: 10px; overflow-y: auto; padding: 8px; z-index: 998; border-top: 2px solid #0078d4; }
     #debug-panel.visible { display: block; }
     .dbg-info { color: #9cdcfe; }
     .dbg-ok { color: #4ec9b0; }
@@ -49,17 +59,18 @@
 </head>
 <body>
 <header>
-  <div>
+  <div class="header-text">
     <h1>🗑️ Junk Unsubscriber</h1>
-    <p>Désinscription des newsletters — Dossier Junk</p>
+    <p>Newsletters — Junk + Boîte de réception</p>
   </div>
+  <button id="debug-toggle" onclick="toggleDebug()" title="Panneau de debug">debug</button>
 </header>
 
 <div class="warning">
   ⚠️ <strong>Conseil sécurité :</strong> Décochez les emails dont vous ne reconnaissez pas l'expéditeur. Se désinscrire d'un vrai spam peut confirmer votre adresse.
 </div>
 
-<button class="btn-primary" id="btn-scan">🔍 Scanner le dossier Junk</button>
+<button class="btn-primary" id="btn-scan">🔍 Scanner Junk + Boîte de réception</button>
 <div id="status"></div>
 
 <div id="results-container" class="hidden">
@@ -74,20 +85,17 @@
   </div>
 </div>
 
-<!-- Debug toggle always visible -->
-<button id="debug-toggle" onclick="toggleDebug()">🐛 Debug</button>
 <div id="debug-panel"></div>
 
 <script>
 // ============================================================
-// DEBUG SYSTEM — logs visible dans le panneau en bas
+// DEBUG SYSTEM — logs visibles dans le panneau
 // ============================================================
 const debugLines = [];
 function dbg(msg, level = "info") {
   const ts = new Date().toLocaleTimeString("fr-FR");
   const cls = level === "ok" ? "dbg-ok" : level === "warn" ? "dbg-warn" : level === "err" ? "dbg-err" : "dbg-info";
-  const line = `[${ts}] ${msg}`;
-  debugLines.push({ line, cls });
+  debugLines.push({ line: `[${ts}] ${msg}`, cls });
   console.log(`[DBG-${level.toUpperCase()}]`, msg);
   renderDebug();
 }
@@ -98,19 +106,16 @@ function renderDebug() {
   panel.scrollTop = panel.scrollHeight;
 }
 function toggleDebug() {
-  const panel = document.getElementById("debug-panel");
-  panel.classList.toggle("visible");
+  document.getElementById("debug-panel").classList.toggle("visible");
 }
 
 // ============================================================
 // CONFIG
 // ============================================================
 const CLIENT_ID = "89bd4984-6324-4be4-b691-5d74abeff00f";
-// FIX MULTI-TENANT : on n'utilise plus le TENANT_ID Rise comme authority.
-// Chaque utilisateur s'authentifie sur SON propre tenant (mantu, dxc, etc.)
-// et accède à SA propre boîte mail via Graph. L'endpoint "organizations"
-// accepte tous les comptes M365 professionnels sans forcer le tenant Rise.
-// Prérequis Azure : l'app doit être passée en AzureADMultipleOrgs.
+// FIX MULTI-TENANT : endpoint "organizations" pour que chaque utilisateur
+// s'authentifie sur SON propre tenant (mantu, dxc, etc.) et accède à SA boîte.
+// L'app Azure est passée en AzureADMultipleOrgs.
 const AUTHORITY = "https://login.microsoftonline.com/organizations";
 const REDIRECT_URI = "https://rise-4.github.io/junk-unsubscriber/JunkUnsubscriber_taskpane.html";
 const GRAPH_SCOPES = ["Mail.ReadWrite"];
@@ -122,11 +127,8 @@ dbg(`Redirect URI: ${REDIRECT_URI}`);
 
 // ============================================================
 // MSAL INIT
-// ============================================================
-// FIX CRITIQUE 1 : cacheLocation "memoryStorage" au lieu de "sessionStorage"
-// Le taskpane s'exécute dans un iframe sandboxé par Office.
-// sessionStorage et localStorage peuvent être bloqués (SecurityError).
-// memoryStorage fonctionne toujours car c'est en mémoire JS.
+// FIX CRITIQUE 1 : cacheLocation "memoryStorage"
+// sessionStorage/localStorage bloqués dans l'iframe sandboxée Office.
 // ============================================================
 let msalInstance = null;
 let msalReady = false;
@@ -139,12 +141,12 @@ const msalConfig = {
     navigateToLoginRequestUrl: false
   },
   cache: {
-    cacheLocation: "memoryStorage",   // <-- FIX : pas sessionStorage
+    cacheLocation: "memoryStorage",
     storeAuthStateInCookie: false
   },
   system: {
     loggerOptions: {
-      logLevel: 3, // Info
+      logLevel: 3,
       loggerCallback: (level, message, containsPii) => {
         if (!containsPii) dbg(`[MSAL] ${message}`, "info");
       }
@@ -161,7 +163,6 @@ async function initMsal() {
     await msalInstance.initialize();
     dbg("MSAL initialize() terminé", "ok");
 
-    // Traiter le retour de redirect (si on utilise redirect au lieu de popup)
     const resp = await msalInstance.handleRedirectPromise();
     if (resp) {
       dbg(`handleRedirectPromise: token reçu pour ${resp.account.username}`, "ok");
@@ -180,9 +181,7 @@ async function initMsal() {
 
 // ============================================================
 // AUTH : getToken()
-// FIX CRITIQUE 2 : Utiliser acquireTokenPopup avec fallback.
-// Dans un iframe Office, les popups PEUVENT être bloqués.
-// Si popup échoue → on tente acquireTokenRedirect.
+// FIX CRITIQUE 2 : waterfall silent → popup → redirect
 // ============================================================
 async function getToken() {
   if (!msalReady) {
@@ -194,7 +193,6 @@ async function getToken() {
   const accounts = msalInstance.getAllAccounts();
   dbg(`Comptes MSAL en cache: ${accounts.length}`);
 
-  // 1) Essayer silent d'abord
   if (accounts.length > 0) {
     try {
       dbg(`Tentative acquireTokenSilent pour ${accounts[0].username}...`);
@@ -209,27 +207,21 @@ async function getToken() {
     }
   }
 
-  // 2) Essayer popup
   try {
     dbg("Tentative acquireTokenPopup...");
-    const result = await msalInstance.acquireTokenPopup({
-      scopes: GRAPH_SCOPES
-    });
+    const result = await msalInstance.acquireTokenPopup({ scopes: GRAPH_SCOPES });
     dbg(`Token popup OK — utilisateur: ${result.account.username}`, "ok");
     return result.accessToken;
   } catch (popupErr) {
     dbg(`acquireTokenPopup échoué: ${popupErr.message}`, "warn");
 
-    // 3) Dernier recours : redirect (la page va se recharger)
     if (popupErr.message && (
       popupErr.message.includes("popup_window_error") ||
       popupErr.message.includes("monitor_window_timeout") ||
       popupErr.message.includes("block")
     )) {
       dbg("Popup bloqué — fallback vers acquireTokenRedirect...", "warn");
-      // Redirect : la page va se recharger, handleRedirectPromise récupèrera le token
       await msalInstance.acquireTokenRedirect({ scopes: GRAPH_SCOPES });
-      // Cette ligne ne sera jamais atteinte (redirect en cours)
       return null;
     }
 
@@ -239,12 +231,6 @@ async function getToken() {
 
 // ============================================================
 // GRAPH API
-// FIX CRITIQUE 3 : Ne pas utiliser $expand pour internetMessageHeaders
-// sur le endpoint mailFolders/junkemail/messages.
-// On doit d'abord lister les messages, puis fetch les headers
-// individuellement pour chaque message.
-// Alternative plus simple : demander les headers directement
-// via $select=internetMessageHeaders (disponible en v1.0).
 // ============================================================
 async function callGraph(url, method, body, token) {
   dbg(`Graph ${method} ${url.substring(0, 100)}...`);
@@ -283,12 +269,10 @@ function extractUnsubscribeUrl(headers) {
   if (!headers || !Array.isArray(headers)) return null;
   const header = headers.find(h => h.name.toLowerCase() === "list-unsubscribe");
   if (!header) return null;
-  // Chercher d'abord une URL HTTPS, puis HTTP
   const httpsMatch = header.value.match(/<(https:\/\/[^>]+)>/i);
   if (httpsMatch) return httpsMatch[1];
   const httpMatch = header.value.match(/<(http:\/\/[^>]+)>/i);
   if (httpMatch) return httpMatch[1];
-  // Parfois l'URL est sans chevrons
   const plainUrl = header.value.match(/(https?:\/\/[^\s,<>]+)/i);
   return plainUrl ? plainUrl[1] : null;
 }
@@ -308,12 +292,10 @@ function escHtml(s) {
 let foundEmails = [];
 
 // ============================================================
-// SCAN — LOGIQUE PRINCIPALE
-// FIX CRITIQUE 4 : Approche en 2 étapes.
-// Étape 1 : Lister les messages du dossier Junk (sans headers).
-// Étape 2 : Pour chaque message, récupérer les internetMessageHeaders
-//           via un appel individuel GET /me/messages/{id}.
-//           On parallélise avec Promise.allSettled par lots de 5.
+// SCAN — JUNK + BOÎTE DE RÉCEPTION
+// FIX CRITIQUE 3 : Approche en 2 étapes (pas de $expand sur junkemail).
+// On scanne les deux dossiers en parallèle, puis on récupère les headers
+// individuellement par lots de 5.
 // ============================================================
 document.getElementById("btn-scan").addEventListener("click", async () => {
   const btn = document.getElementById("btn-scan");
@@ -324,7 +306,6 @@ document.getElementById("btn-scan").addEventListener("click", async () => {
   foundEmails = [];
 
   try {
-    // Auth
     const token = await getToken();
     if (!token) {
       setStatus("⏳ Redirection d'authentification en cours...");
@@ -333,42 +314,57 @@ document.getElementById("btn-scan").addEventListener("click", async () => {
     }
     dbg(`Token obtenu (${token.substring(0,20)}...)`, "ok");
 
-    // Étape 1 : Lister les messages du dossier Junk
-    setStatus("Scan du dossier Junk...");
-    const listUrl = "https://graph.microsoft.com/v1.0/me/mailFolders/junkemail/messages?$top=50&$select=id,subject,from";
-    const data = await callGraph(listUrl, "GET", null, token);
+    // Étape 1 : Lister les messages des deux dossiers en parallèle
+    setStatus("Scan Junk + Boîte de réception...");
+    dbg("Scan des deux dossiers en parallèle...", "info");
 
-    if (!data || !data.value || data.value.length === 0) {
-      setStatus("✅ Dossier Junk vide ou aucun email trouvé.");
-      dbg("Aucun message dans Junk", "info");
+    const [junkData, inboxData] = await Promise.all([
+      callGraph(
+        "https://graph.microsoft.com/v1.0/me/mailFolders/junkemail/messages?$top=50&$select=id,subject,from",
+        "GET", null, token
+      ).catch(err => { dbg(`Erreur scan Junk: ${err.message}`, "warn"); return null; }),
+      callGraph(
+        "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?$top=50&$select=id,subject,from",
+        "GET", null, token
+      ).catch(err => { dbg(`Erreur scan Inbox: ${err.message}`, "warn"); return null; })
+    ]);
+
+    const junkMsgs  = (junkData?.value  || []).map(m => ({ ...m, folder: "junk"  }));
+    const inboxMsgs = (inboxData?.value || []).map(m => ({ ...m, folder: "inbox" }));
+    const allMessages = [...junkMsgs, ...inboxMsgs];
+
+    dbg(`Junk: ${junkMsgs.length} msg — Inbox: ${inboxMsgs.length} msg — Total: ${allMessages.length}`, "ok");
+
+    if (allMessages.length === 0) {
+      setStatus("✅ Aucun email trouvé dans les deux dossiers.");
       btn.disabled = false;
       return;
     }
 
-    dbg(`${data.value.length} message(s) trouvé(s) dans Junk`, "ok");
-    setStatus(`${data.value.length} email(s) trouvé(s) — Analyse des headers...`);
+    setStatus(`${allMessages.length} email(s) trouvé(s) — Analyse des headers...`);
 
-    // Étape 2 : Récupérer les headers pour chaque message (par lots de 5)
-    const messages = data.value;
+    // Étape 2 : Récupérer les headers individuellement (lots de 5)
     const batchSize = 5;
     let processed = 0;
 
-    for (let i = 0; i < messages.length; i += batchSize) {
-      const batch = messages.slice(i, i + batchSize);
+    for (let i = 0; i < allMessages.length; i += batchSize) {
+      const batch = allMessages.slice(i, i + batchSize);
       const promises = batch.map(msg =>
         callGraph(
           `https://graph.microsoft.com/v1.0/me/messages/${msg.id}?$select=id,subject,from,internetMessageHeaders`,
           "GET", null, token
-        ).catch(err => {
-          dbg(`Erreur header pour ${msg.id}: ${err.message}`, "warn");
-          return null;
-        })
+        ).then(detail => ({ detail, folder: msg.folder }))
+         .catch(err => {
+           dbg(`Erreur header pour ${msg.id}: ${err.message}`, "warn");
+           return null;
+         })
       );
 
       const results = await Promise.all(promises);
 
-      for (const detail of results) {
-        if (!detail) continue;
+      for (const item of results) {
+        if (!item || !item.detail) continue;
+        const { detail, folder } = item;
         const headers = detail.internetMessageHeaders || [];
         const unsubUrl = extractUnsubscribeUrl(headers);
         const hasListUnsub = headers.some(h => h.name.toLowerCase() === "list-unsubscribe");
@@ -376,24 +372,24 @@ document.getElementById("btn-scan").addEventListener("click", async () => {
         if (unsubUrl) {
           foundEmails.push({
             id: detail.id,
+            folder,
             subject: detail.subject || "(sans objet)",
             sender: detail.from?.emailAddress?.name || detail.from?.emailAddress?.address || "Inconnu",
             senderEmail: detail.from?.emailAddress?.address || "",
             unsubUrl
           });
-          dbg(`✓ Newsletter détectée: ${detail.from?.emailAddress?.address} → ${unsubUrl.substring(0, 60)}`, "ok");
+          dbg(`✓ [${folder}] ${detail.from?.emailAddress?.address} → ${unsubUrl.substring(0, 60)}`, "ok");
         } else if (hasListUnsub) {
-          dbg(`⚠ List-Unsubscribe trouvé mais pas d'URL HTTP pour: ${detail.from?.emailAddress?.address}`, "warn");
+          dbg(`⚠ [${folder}] List-Unsubscribe sans URL HTTP: ${detail.from?.emailAddress?.address}`, "warn");
         }
       }
 
       processed += batch.length;
-      setStatus(`Analyse des headers... ${processed}/${messages.length}`);
+      setStatus(`Analyse des headers... ${processed}/${allMessages.length}`);
     }
 
     if (foundEmails.length === 0) {
-      setStatus(`✅ ${messages.length} email(s) analysé(s) — Aucune newsletter avec lien de désinscription détectée.`);
-      dbg("Aucune newsletter avec List-Unsubscribe HTTP trouvée", "info");
+      setStatus(`✅ ${allMessages.length} email(s) analysé(s) — Aucune newsletter détectée.`);
       btn.disabled = false;
       return;
     }
@@ -422,19 +418,21 @@ function renderResults() {
   label.innerHTML = `<span class="count-badge">${foundEmails.length}</span> newsletter(s) trouvée(s)`;
 
   foundEmails.forEach((email, i) => {
+    const folderLabel = email.folder === "junk"
+      ? `<span class="folder-badge junk">Junk</span>`
+      : `<span class="folder-badge inbox">Inbox</span>`;
     const div = document.createElement("div");
     div.className = "email-item";
     div.innerHTML = `
       <input type="checkbox" class="email-checkbox" data-index="${i}" checked/>
       <div class="email-info">
-        <div class="email-sender">${escHtml(email.sender)}</div>
+        <div class="email-sender">${folderLabel}${escHtml(email.sender)}</div>
         <div class="email-subject">${escHtml(email.subject)}</div>
         <div class="email-unsub" title="${escHtml(email.unsubUrl)}">🔗 ${escHtml(email.unsubUrl.substring(0, 50))}...</div>
       </div>`;
     container.appendChild(div);
   });
 
-  // Reset select-all
   document.getElementById("select-all").checked = true;
 }
 
@@ -446,19 +444,21 @@ document.getElementById("select-all").addEventListener("change", function() {
 });
 
 // ============================================================
-// UNSUBSCRIBE
+// UNSUBSCRIBE — avec déduplication des URLs
 // FIX 5 : Office.context.ui.displayDialogAsync au lieu de window.open
-// window.open est souvent bloqué dans les iframes Office.
-// displayDialogAsync ouvre une fenêtre autorisée par Office.
-// Fallback sur window.open si Office.context.ui n'est pas dispo.
+// Dédup : si la même URL de désinscription apparaît plusieurs fois,
+// on n'ouvre qu'une seule page (évite 50 onglets pour le même site).
 // ============================================================
 document.getElementById("btn-unsub").addEventListener("click", () => {
   const checked = getChecked();
   if (checked.length === 0) { setStatus("Sélectionnez au moins un email."); return; }
 
+  // Déduplication : une seule ouverture par URL unique
+  const uniqueUrls = [...new Set(checked.map(i => foundEmails[i].unsubUrl))];
+  dbg(`Désinscription : ${checked.length} email(s) → ${uniqueUrls.length} URL(s) unique(s)`, "info");
+
   let opened = 0;
-  checked.forEach(i => {
-    const url = foundEmails[i].unsubUrl;
+  uniqueUrls.forEach(url => {
     dbg(`Ouverture désinscription: ${url}`);
     try {
       if (Office && Office.context && Office.context.ui && Office.context.ui.displayDialogAsync) {
@@ -480,7 +480,10 @@ document.getElementById("btn-unsub").addEventListener("click", () => {
       opened++;
     }
   });
-  setStatus(`🔗 ${opened} page(s) de désinscription ouvertes.`);
+
+  const skipped = checked.length - uniqueUrls.length;
+  const skipMsg = skipped > 0 ? ` (${skipped} doublon(s) ignoré(s))` : "";
+  setStatus(`🔗 ${opened} page(s) de désinscription ouvertes${skipMsg}.`);
 });
 
 // ============================================================
@@ -496,8 +499,7 @@ document.getElementById("btn-delete").addEventListener("click", async () => {
 
   try {
     const token = await getToken();
-    let ok = 0;
-    let errors = 0;
+    let ok = 0, errors = 0;
     for (const i of checked) {
       try {
         await callGraph(
@@ -505,13 +507,12 @@ document.getElementById("btn-delete").addEventListener("click", async () => {
           "DELETE", null, token
         );
         ok++;
-        dbg(`Supprimé: ${foundEmails[i].sender} — ${foundEmails[i].subject}`, "ok");
+        dbg(`Supprimé: [${foundEmails[i].folder}] ${foundEmails[i].sender}`, "ok");
       } catch (e) {
         errors++;
         dbg(`Erreur suppression ${foundEmails[i].id}: ${e.message}`, "err");
       }
     }
-    // Retirer les emails supprimés
     const checkedSet = new Set(checked);
     foundEmails = foundEmails.filter((_, i) => !checkedSet.has(i));
     setStatus(`✅ ${ok} email(s) supprimé(s)${errors > 0 ? `, ${errors} erreur(s)` : ""}.`);
@@ -537,7 +538,6 @@ function getChecked() {
 
 // ============================================================
 // OFFICE.JS INIT
-// On attend que Office soit prêt avant d'activer le bouton.
 // ============================================================
 let officeReady = false;
 
@@ -547,16 +547,14 @@ Office.onReady((info) => {
   document.getElementById("btn-scan").disabled = false;
 });
 
-// Timeout : si Office.onReady ne se déclenche pas en 5s, on active quand même
-// (peut arriver si la page est testée hors Outlook)
+// Timeout : si Office.onReady ne répond pas en 5s (test hors Outlook)
 setTimeout(() => {
   if (!officeReady) {
-    dbg("Office.onReady n'a pas répondu en 5s — activation du bouton quand même", "warn");
+    dbg("Office.onReady n'a pas répondu en 5s — activation bouton quand même", "warn");
     document.getElementById("btn-scan").disabled = false;
   }
 }, 5000);
 
-// Désactiver le bouton au départ (sera activé par Office.onReady ou le timeout)
 document.getElementById("btn-scan").disabled = true;
 
 // ============================================================
@@ -574,16 +572,14 @@ initMsal().then(() => {
 (function runDiagnostics() {
   dbg("=== DIAGNOSTICS ===", "info");
 
-  // Test sessionStorage
   try {
     sessionStorage.setItem("__test", "1");
     sessionStorage.removeItem("__test");
-    dbg("sessionStorage: accessible (mais non utilisé)", "ok");
+    dbg("sessionStorage: accessible (non utilisé — memoryStorage actif)", "ok");
   } catch (e) {
-    dbg("sessionStorage: BLOQUÉ (normal dans iframe Office) — memoryStorage utilisé", "warn");
+    dbg("sessionStorage: BLOQUÉ (normal dans iframe Office)", "warn");
   }
 
-  // Test localStorage
   try {
     localStorage.setItem("__test", "1");
     localStorage.removeItem("__test");
@@ -592,15 +588,10 @@ initMsal().then(() => {
     dbg("localStorage: BLOQUÉ (normal dans iframe Office)", "warn");
   }
 
-  // Environnement
-  dbg(`URL actuelle: ${window.location.href}`, "info");
+  dbg(`URL: ${window.location.href}`, "info");
   dbg(`User-Agent: ${navigator.userAgent.substring(0, 80)}`, "info");
-  dbg(`Window est iframe: ${window !== window.top}`, "info");
-
-  // Vérifier que MSAL est chargé
+  dbg(`Iframe: ${window !== window.top}`, "info");
   dbg(`msal global: ${typeof msal !== 'undefined' ? 'OK' : 'MANQUANT'}`, typeof msal !== 'undefined' ? "ok" : "err");
-
-  // Vérifier que Office est chargé
   dbg(`Office global: ${typeof Office !== 'undefined' ? 'OK' : 'MANQUANT'}`, typeof Office !== 'undefined' ? "ok" : "err");
 
   dbg("=== FIN DIAGNOSTICS ===", "info");
