@@ -248,8 +248,21 @@ let groups = []; // array of { sender, senderEmail, unsubUrl, folders: Set, emai
 let junkNextLink = null;
 let inboxNextLink = null;
 
+// Extrait le domaine "racine" (2 derniers labels) d'un email pour regrouper
+// les variantes VERP / sous-domaines (bounce-xxx@mail.acme.com → acme.com,
+// news@e.linkedin.com → linkedin.com). Fallback sur l'email complet normalisé.
+function groupingKey(senderEmail) {
+  const email = (senderEmail || "").trim().toLowerCase();
+  const at = email.lastIndexOf("@");
+  if (at === -1) return email;
+  const domain = email.slice(at + 1);
+  const parts = domain.split(".").filter(Boolean);
+  if (parts.length < 2) return email;
+  return parts.slice(-2).join(".");
+}
+
 function findOrCreateGroup(senderEmail, unsubUrl, sender) {
-  const key = (senderEmail || "").trim().toLowerCase();
+  const key = groupingKey(senderEmail);
   let g = groups.find(g => g.key === key);
   if (!g) {
     g = { key, sender, senderEmail, unsubUrl, folders: new Set(), emails: [] };
