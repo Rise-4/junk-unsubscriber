@@ -107,6 +107,20 @@
 
 <script>
 // ============================================================
+// GARDE-FOU : si cette page est chargée dans un popup MSAL
+// (window.opener présent + hash d'auth), on délègue juste à MSAL
+// et on ne lance PAS l'UI du taskpane (évite block_nested_popups).
+// ============================================================
+if (window.opener && window.opener !== window && /[#&](code|error|id_token|access_token)=/.test(window.location.hash)) {
+  document.addEventListener("DOMContentLoaded", () => {
+    document.body.innerHTML = "<p style='font-family:Segoe UI;font-size:12px;color:#605e5c;padding:20px'>Authentification…</p>";
+  });
+  // MSAL (chargé par le <script> au-dessus) traitera le hash via handleRedirectPromise
+  // puis fermera automatiquement le popup. On n'exécute pas la suite.
+  throw new Error("__msal_popup_redirect__");
+}
+
+// ============================================================
 // DEBUG
 // ============================================================
 const debugLines = [];
@@ -131,7 +145,9 @@ function toggleDebug() { document.getElementById("debug-panel").classList.toggle
 const CLIENT_ID   = "89bd4984-6324-4be4-b691-5d74abeff00f";
 // Multi-tenant : chaque utilisateur s'authentifie sur SON tenant (Rise, Mantu, DXC…)
 const AUTHORITY   = "https://login.microsoftonline.com/organizations";
-const REDIRECT_URI = "https://rise-4.github.io/junk-unsubscriber/JunkUnsubscriber_taskpane.html";
+// Page dédiée pour la redirection : évite de recharger le taskpane dans le popup
+// (sinon block_nested_popups quand la 2e instance re-init MSAL).
+const REDIRECT_URI = "https://rise-4.github.io/junk-unsubscriber/auth-redirect.html";
 const GRAPH_SCOPES = ["Mail.ReadWrite"];
 const PAGE_SIZE   = 100; // emails par dossier par page
 
@@ -145,9 +161,9 @@ let msalInstance = null, msalReady = false;
 const msalConfig = {
   auth: { clientId: CLIENT_ID, authority: AUTHORITY, redirectUri: REDIRECT_URI, navigateToLoginRequestUrl: false },
   cache: {
-    // memoryStorage : sessionStorage/localStorage bloqués dans l'iframe sandboxée Office.
-    // storeAuthStateInCookie permet au flow redirect de survivre au rechargement de page.
-    cacheLocation: "memoryStorage",
+    // localStorage : partage l'état d'interaction entre taskpane et popup d'auth
+    // (les diagnostics confirment qu'il est accessible dans ce contexte).
+    cacheLocation: "localStorage",
     storeAuthStateInCookie: true
   },
   system: {

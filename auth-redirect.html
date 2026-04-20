@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8"/>
+  <title>Auth…</title>
+  <script src="https://rise-4.github.io/junk-unsubscriber/msal-browser.min.js"></script>
+</head>
+<body>
+<p style="font-family:Segoe UI,sans-serif;font-size:12px;color:#605e5c;padding:20px">Authentification en cours…</p>
+<script>
+// Page de redirection dédiée MSAL : se contente de traiter le hash puis se ferme.
+// Évite de recharger tout le taskpane dans le popup (cause de block_nested_popups).
+(async () => {
+  try {
+    const msalInstance = new msal.PublicClientApplication({
+      auth: {
+        clientId: "89bd4984-6324-4be4-b691-5d74abeff00f",
+        authority: "https://login.microsoftonline.com/organizations",
+        redirectUri: "https://rise-4.github.io/junk-unsubscriber/auth-redirect.html",
+        navigateToLoginRequestUrl: false
+      },
+      cache: { cacheLocation: "localStorage", storeAuthStateInCookie: true }
+    });
+    await msalInstance.initialize();
+    await msalInstance.handleRedirectPromise();
+  } catch (e) {
+    document.body.innerHTML = "<p style='color:#a4262c;font-family:Segoe UI;padding:20px'>Erreur auth : " + (e?.message || e) + "</p>";
+  }
+})();
+</script>
+</body>
+</html>
