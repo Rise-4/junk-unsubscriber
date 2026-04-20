@@ -100,6 +100,7 @@
   </div>
   <div class="action-bar">
     <button class="btn-secondary" id="btn-unsub-bulk">🔗 Se désinscrire (sélectionnés)</button>
+    <button class="btn-secondary" id="btn-archive-bulk">📦 Archiver (sélectionnés)</button>
   </div>
 </div>
 
@@ -576,6 +577,33 @@ document.getElementById("btn-unsub-bulk").addEventListener("click", () => {
     } catch (e) { window.open(url, "_blank"); opened++; }
   });
   setStatus(`🔗 ${opened} page(s) de désinscription ouvertes.`);
+});
+
+// ============================================================
+// BULK ARCHIVE (sélectionnés)
+// ============================================================
+document.getElementById("btn-archive-bulk").addEventListener("click", async () => {
+  const btn = document.getElementById("btn-archive-bulk");
+  const checkedIdx = [...document.querySelectorAll(".group-checkbox:checked")].map(cb => parseInt(cb.dataset.idx));
+  if (checkedIdx.length === 0) { setStatus("Sélectionnez au moins un expéditeur."); return; }
+
+  btn.disabled = true;
+  const originalLabel = btn.textContent;
+  btn.textContent = "⏳ Archivage...";
+
+  let done = 0;
+  for (const idx of checkedIdx) {
+    const card = document.querySelector(`.group-item[data-idx="${idx}"]`);
+    const archiveBtn = card?.querySelector(".btn-sm.archive");
+    if (!card || !archiveBtn) continue;
+    await archiveGroup(idx, card, archiveBtn);
+    done++;
+    setStatus(`📦 Archivage... ${done}/${checkedIdx.length}`);
+  }
+
+  btn.disabled = false;
+  btn.textContent = originalLabel;
+  setStatus(`✅ ${done} expéditeur(s) archivé(s).`);
 });
 
 // ============================================================
