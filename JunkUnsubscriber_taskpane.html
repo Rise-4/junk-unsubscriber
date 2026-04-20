@@ -249,9 +249,10 @@ let junkNextLink = null;
 let inboxNextLink = null;
 
 function findOrCreateGroup(senderEmail, unsubUrl, sender) {
-  let g = groups.find(g => g.senderEmail === senderEmail && g.unsubUrl === unsubUrl);
+  const key = (senderEmail || "").trim().toLowerCase();
+  let g = groups.find(g => g.key === key);
   if (!g) {
-    g = { sender, senderEmail, unsubUrl, folders: new Set(), emails: [] };
+    g = { key, sender, senderEmail, unsubUrl, folders: new Set(), emails: [] };
     groups.push(g);
   }
   return g;
