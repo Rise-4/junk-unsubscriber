@@ -555,13 +555,11 @@ async function executeUnsubscribe(idx, cardEl, unsubBtn, archiveBtn) {
       dbg(`One-click POST → ${info.oneClickUrl}`);
       const ok = await postOneClickUnsubscribe(info.oneClickUrl);
       if (ok) {
-        // Feedback visuel FORT : la carte devient verte, le bouton montre "✅ Désinscrit"
-        // pendant 1.2s avant de lancer l'archivage → l'utilisateur voit clairement que
-        // quelque chose s'est passé (one-click est silencieux sinon).
-        markCardSuccess(cardEl, unsubBtn, `✅ Désinscrit de ${group.sender}`);
-        setStatus(`✅ Désinscription 1-clic envoyée à ${group.sender} — archivage auto dans 1s…`);
-        await new Promise(r => setTimeout(r, 1200));
-        await autoArchiveAfterUnsub(idx, cardEl);
+        // Feedback visuel : carte verte + bouton "✅ Désinscrit" (le one-click est
+        // silencieux côté serveur, sans ça on ne verrait rien).
+        // La carte reste visible — le bouton Archiver est séparé, à la main de l'user.
+        markCardSuccess(cardEl, unsubBtn, `✅ Désinscrit`);
+        setStatus(`✅ Désinscription envoyée à ${group.sender}. Clique 📦 Archiver pour nettoyer les ${group.emails.length} email(s) existants.`);
         return;
       }
       dbg(`One-click POST échoué, fallback popup`, "warn");
@@ -578,9 +576,7 @@ async function executeUnsubscribe(idx, cardEl, unsubBtn, archiveBtn) {
           "POST", null, token
         );
         markCardSuccess(cardEl, unsubBtn, `✅ Mail envoyé`);
-        setStatus(`✅ Mail de désinscription envoyé à ${group.sender} — archivage auto dans 1s…`);
-        await new Promise(r => setTimeout(r, 1200));
-        await autoArchiveAfterUnsub(idx, cardEl);
+        setStatus(`✅ Mail de désinscription envoyé à ${group.sender}. Clique 📦 Archiver pour nettoyer les ${group.emails.length} email(s) existants.`);
         return;
       } catch (err) {
         dbg(`Graph /unsubscribe ERREUR: ${err.message} — fallback popup`, "warn");
@@ -645,7 +641,8 @@ function openUrlPopup(url) {
 }
 
 // Feedback visuel quand la désinscription a réussi mais qu'il n'y a pas de page à ouvrir
-// (one-click POST ou Graph mailto). Carte verte + badge ✅ pendant 1.2s.
+// (one-click POST ou Graph mailto). Carte verte + bouton "✅ Désinscrit" désactivé.
+// La carte reste visible, l'archivage reste à la main de l'utilisateur.
 function markCardSuccess(cardEl, unsubBtn, label) {
   cardEl.style.transition = "background 0.3s, border-color 0.3s";
   cardEl.style.background = "#dff6dd";
@@ -655,16 +652,6 @@ function markCardSuccess(cardEl, unsubBtn, label) {
   unsubBtn.style.borderColor = "#107c10";
   unsubBtn.style.background = "#f0fbef";
   unsubBtn.disabled = true;
-}
-
-// Après une désinscription confirmée (one-click ou Graph mailto), archive les emails
-// déjà reçus de cet expéditeur et retire la carte de l'UI.
-async function autoArchiveAfterUnsub(idx, cardEl) {
-  const group = groups[idx];
-  if (!group) return;
-  const archiveBtn = cardEl.querySelector(".btn-sm.archive");
-  // archiveGroup gère déjà le retrait du groupe + update UI
-  await archiveGroup(idx, cardEl, archiveBtn);
 }
 
 // ============================================================
@@ -776,7 +763,13 @@ document.getElementById("btn-unsub-bulk").addEventListener("click", async () => 
       postOneClickUnsubscribe(groups[i].info.oneClickUrl).then(r => ({ i, r }))
     ));
     for (const { i, r } of results) {
-      if (r) { ok++; } else { errors++; }
+      if (r) {
+        ok++;
+        // Feedback visuel sur chaque carte désinscrite
+        const card = document.querySelector(`.group-item[data-idx="${i}"]`);
+        const unsubBtn = card?.querySelector(".btn-sm.unsub");
+        if (card && unsubBtn) markCardSuccess(card, unsubBtn, `✅ Désinscrit`);
+      } else { errors++; }
     }
   }
 
@@ -793,19 +786,13 @@ document.getElementById("btn-unsub-bulk").addEventListener("click", async () => 
               "POST", null, token
             );
             ok++;
+            const card = document.querySelector(`.group-item[data-idx="${i}"]`);
+            const unsubBtn = card?.querySelector(".btn-sm.unsub");
+            if (card && unsubBtn) markCardSuccess(card, unsubBtn, `✅ Mail envoyé`);
           } catch (e) { errors++; dbg(`Graph /unsubscribe ${i}: ${e.message}`, "err"); }
         }
       }
     } catch (e) { dbg(`Bulk mailto token: ${e.message}`, "err"); }
-  }
-
-  // --- Auto-archive des groupes désinscrits (1-clic + mailto) ---
-  btn.textContent = `⏳ archivage…`;
-  const toArchive = [...oneClickIdx, ...mailtoIdx];
-  for (const i of toArchive) {
-    const card = document.querySelector(`.group-item[data-idx="${i}"]`);
-    const archiveBtn = card?.querySelector(".btn-sm.archive");
-    if (card && archiveBtn) await archiveGroup(i, card, archiveBtn);
   }
 
   // --- Popup : impossible en masse, on explique ---
@@ -814,6 +801,7 @@ document.getElementById("btn-unsub-bulk").addEventListener("click", async () => 
   if (popupIdx.length > 0) {
     msg += `. ⚠️ ${popupIdx.length} expéditeur(s) nécessitent une page web — clique "Se désinscrire" sur chacun.`;
   }
+  if (ok > 0) msg += ` Utilise 📦 Archiver (sélectionnés) pour nettoyer les emails existants.`;
   setStatus(msg);
 
   btn.disabled = false;
