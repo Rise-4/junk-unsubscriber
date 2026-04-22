@@ -347,10 +347,12 @@ function findOrCreateGroup(senderEmail, info, sender) {
 }
 
 // ============================================================
-// FETCH + PROCESS A PAGE (Graph $batch — 20 requêtes par appel)
+// FETCH + PROCESS A PAGE
 // ============================================================
-// On ne récupère QUE les headers (pas le body) : ~2 KB par email au lieu de
-// 50-200 KB. Gain typique : 5-10x plus rapide.
+// Chemin rapide : on demande internetMessageHeaders directement dans le list call
+// ($select=internetMessageHeaders). Un seul appel Graph pour ~200 emails.
+// Fallback : si Graph omet les headers pour certains messages (limite serveur
+// historique), on rattrape avec un $batch (20 req/call, parallèle).
 async function fetchAndProcess(url, folder, token) {
   const data = await callGraph(url, "GET", null, token).catch(err => {
     dbg(`Erreur scan ${folder}: ${err.message}`, "warn");
@@ -361,44 +363,60 @@ async function fetchAndProcess(url, folder, token) {
   const messages = data.value || [];
   dbg(`${folder}: ${messages.length} messages`, "ok");
 
-  const BATCH = 20; // Graph $batch max = 20
-  for (let i = 0; i < messages.length; i += BATCH) {
-    const slice = messages.slice(i, i + BATCH);
-    const requests = slice.map((msg, idx) => ({
-      id: String(idx),
-      method: "GET",
-      url: `/me/messages/${msg.id}?$select=id,subject,from,internetMessageHeaders`
-    }));
-
-    let responses = [];
-    try {
-      const resp = await callGraph(
-        "https://graph.microsoft.com/v1.0/$batch",
-        "POST", { requests }, token
-      );
-      responses = resp.responses || [];
-    } catch (err) {
-      dbg(`Batch ${i}: ${err.message}`, "warn");
-      continue;
-    }
-
-    for (const r of responses) {
-      if (r.status !== 200 || !r.body) {
-        if (r.status === 429) dbg(`Sub-request 429 (throttled) — ignoré`, "warn");
-        continue;
-      }
-      const d = r.body;
-      const info = extractUnsubscribeInfo(d.internetMessageHeaders || []);
-      if (!info.method) continue;
-      const senderEmail = d.from?.emailAddress?.address || "";
-      const sender      = d.from?.emailAddress?.name || senderEmail || "Inconnu";
-      const g = findOrCreateGroup(senderEmail, info, sender);
-      g.folders.add(folder);
-      g.emails.push({ id: d.id, subject: d.subject || "(sans objet)", folder });
-    }
-    setStatus(`Analyse ${folder}… ${Math.min(i + BATCH, messages.length)}/${messages.length} — ${groups.length} expéditeur(s)`);
+  // Chemin rapide : process inline les messages qui ont déjà leurs headers
+  const needsFallback = [];
+  for (const d of messages) {
+    if (!d.internetMessageHeaders) { needsFallback.push(d); continue; }
+    processMessageIntoGroups(d, folder);
   }
+
+  // Fallback : fetch individuel pour ceux sans headers. $batch parallèle (3 concurrents).
+  if (needsFallback.length > 0) {
+    dbg(`${folder}: fallback $batch pour ${needsFallback.length} message(s)`, "warn");
+    await fetchHeadersWithBatch(needsFallback, folder, token);
+  }
+
+  setStatus(`✅ ${folder} : ${messages.length} emails — ${groups.length} expéditeur(s) au total`);
   return data["@odata.nextLink"] || null;
+}
+
+function processMessageIntoGroups(d, folder) {
+  const info = extractUnsubscribeInfo(d.internetMessageHeaders || []);
+  if (!info.method) return;
+  const senderEmail = d.from?.emailAddress?.address || "";
+  const sender      = d.from?.emailAddress?.name || senderEmail || "Inconnu";
+  const g = findOrCreateGroup(senderEmail, info, sender);
+  g.folders.add(folder);
+  g.emails.push({ id: d.id, subject: d.subject || "(sans objet)", folder });
+}
+
+// Fallback $batch. On parallélise jusqu'à 3 batches simultanés pour rester sous
+// le seuil de throttling de Graph (429 au-delà typiquement).
+async function fetchHeadersWithBatch(messages, folder, token) {
+  const BATCH = 20;
+  const CONCURRENCY = 3;
+  const allBatches = [];
+  for (let i = 0; i < messages.length; i += BATCH) {
+    allBatches.push(messages.slice(i, i + BATCH));
+  }
+
+  for (let i = 0; i < allBatches.length; i += CONCURRENCY) {
+    const wave = allBatches.slice(i, i + CONCURRENCY);
+    await Promise.all(wave.map(async slice => {
+      const requests = slice.map((msg, idx) => ({
+        id: String(idx),
+        method: "GET",
+        url: `/me/messages/${msg.id}?$select=id,subject,from,internetMessageHeaders`
+      }));
+      try {
+        const resp = await callGraph("https://graph.microsoft.com/v1.0/$batch", "POST", { requests }, token);
+        for (const r of (resp.responses || [])) {
+          if (r.status !== 200 || !r.body) continue;
+          processMessageIntoGroups(r.body, folder);
+        }
+      } catch (err) { dbg(`Batch fallback: ${err.message}`, "warn"); }
+    }));
+  }
 }
 
 // ============================================================
@@ -419,13 +437,15 @@ document.getElementById("btn-scan").addEventListener("click", async () => {
     if (!token) { setStatus("⏳ Redirection d'authentification..."); btn.disabled = false; return; }
 
     setStatus("Scan en cours...");
+    // $select=internetMessageHeaders évite un second passage $batch — un seul appel suffit.
+    const SELECT = "id,subject,from,internetMessageHeaders";
     const [junkNext, inboxNext] = await Promise.all([
       fetchAndProcess(
-        `https://graph.microsoft.com/v1.0/me/mailFolders/junkemail/messages?$top=${PAGE_SIZE}&$select=id,subject,from`,
+        `https://graph.microsoft.com/v1.0/me/mailFolders/junkemail/messages?$top=${PAGE_SIZE}&$select=${SELECT}`,
         "junk", token
       ),
       fetchAndProcess(
-        `https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?$top=${PAGE_SIZE}&$select=id,subject,from`,
+        `https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?$top=${PAGE_SIZE}&$select=${SELECT}`,
         "inbox", token
       )
     ]);
