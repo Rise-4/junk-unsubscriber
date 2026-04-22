@@ -263,17 +263,16 @@ async function callGraph(url, method, body, token, retries = 3) {
 }
 
 // ============================================================
-// HEADER + BODY PARSING (RFC 8058 aware)
+// HEADER PARSING (RFC 8058 aware)
 // ============================================================
-// Retourne { oneClickUrl, mailtoUrl, httpsUrl, bodyUrl, displayUrl, method }
-// - oneClickUrl : URL à POSTer en RFC 8058 one-click (header + List-Unsubscribe-Post)
-// - mailtoUrl   : mailto: trouvé dans le header (utilisable via Graph /unsubscribe)
-// - httpsUrl    : URL HTTPS du header (fallback popup si pas de one-click)
-// - bodyUrl     : URL "Unsubscribe" trouvée dans le body HTML (user-friendly pour affichage)
-// - displayUrl  : URL à afficher dans l'UI (bodyUrl > httpsUrl)
-// - method      : "one-click" | "graph-mailto" | "popup" | null
-function extractUnsubscribeInfo(headers, bodyHtml) {
-  const info = { oneClickUrl: null, mailtoUrl: null, httpsUrl: null, bodyUrl: null, displayUrl: null, method: null };
+// Retourne { oneClickUrl, mailtoUrl, httpsUrl, displayLabel, method }
+// - oneClickUrl  : URL à POSTer en RFC 8058 one-click (header + List-Unsubscribe-Post)
+// - mailtoUrl    : mailto: trouvé dans le header (utilisable via Graph /unsubscribe)
+// - httpsUrl     : URL HTTPS du header (fallback popup si pas de one-click)
+// - displayLabel : courte description user-friendly (hostname ou adresse mailto)
+// - method       : "one-click" | "graph-mailto" | "popup" | null
+function extractUnsubscribeInfo(headers) {
+  const info = { oneClickUrl: null, mailtoUrl: null, httpsUrl: null, displayLabel: "", method: null };
   const hs = Array.isArray(headers) ? headers : [];
   const byName = (n) => hs.find(h => h.name && h.name.toLowerCase() === n.toLowerCase());
 
@@ -281,55 +280,32 @@ function extractUnsubscribeInfo(headers, bodyHtml) {
   const luPost = byName("list-unsubscribe-post");
 
   if (lu && lu.value) {
-    // Parser tous les <...> du header (peut contenir mailto + https, ou plusieurs https)
     const tokens = [...lu.value.matchAll(/<([^>]+)>/g)].map(m => m[1].trim());
     for (const t of tokens) {
       if (/^mailto:/i.test(t) && !info.mailtoUrl) info.mailtoUrl = t;
       else if (/^https?:\/\//i.test(t) && !info.httpsUrl) info.httpsUrl = t;
     }
-    // Fallback : URL nue sans chevrons (non-conforme mais vu dans la nature)
     if (!info.httpsUrl && !info.mailtoUrl) {
       const plain = lu.value.match(/(https?:\/\/[^\s,<>]+)/i);
       if (plain) info.httpsUrl = plain[1];
     }
-    // One-click RFC 8058 : requiert List-Unsubscribe-Post: List-Unsubscribe=One-Click
     if (luPost && /list-unsubscribe\s*=\s*one-click/i.test(luPost.value) && info.httpsUrl) {
       info.oneClickUrl = info.httpsUrl;
     }
   }
 
-  // Body scraping : chercher <a href="..."> dont le texte contient "unsubscribe"/"désabonner"/"abmelden"
-  if (bodyHtml && typeof bodyHtml === "string") {
-    info.bodyUrl = findUnsubscribeLinkInBody(bodyHtml);
+  // Label affiché : hostname (propre, lisible) plutôt que l'URL brute type /api/...
+  if (info.oneClickUrl || info.httpsUrl) {
+    try { info.displayLabel = new URL(info.oneClickUrl || info.httpsUrl).hostname; }
+    catch { info.displayLabel = (info.oneClickUrl || info.httpsUrl).substring(0, 40); }
+  } else if (info.mailtoUrl) {
+    info.displayLabel = info.mailtoUrl.replace(/^mailto:/i, "").split("?")[0];
   }
 
-  // URL à afficher : préférer le body (user-friendly, ex: linear.app/unsubscribe)
-  // au header (ex: linear.app/api/unsubscribe qui répond 404 en GET)
-  info.displayUrl = info.bodyUrl || info.httpsUrl || info.mailtoUrl;
-
-  // Méthode d'action prioritaire
   if (info.oneClickUrl)      info.method = "one-click";
   else if (info.mailtoUrl)   info.method = "graph-mailto";
-  else if (info.httpsUrl || info.bodyUrl) info.method = "popup";
+  else if (info.httpsUrl)    info.method = "popup";
   return info;
-}
-
-// Cherche un lien de désinscription dans le HTML du body.
-// Priorité : <a> dont le texte match unsubscribe/désabonner/abmelden.
-function findUnsubscribeLinkInBody(html) {
-  // Décodage minimal des entités HTML fréquentes
-  const decode = (s) => s.replace(/&amp;/g, "&").replace(/&#39;/g, "'").replace(/&quot;/g, '"');
-  // Match <a ...href="URL"...>...UNSUB_TEXT...</a>
-  const re = /<a\b[^>]*?href\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
-  const keywords = /(un[-\s]?subscribe|d[ée]s[-\s]?abonner|d[ée]sabonnement|abmelden|cancel[-\s]?subscription|opt[-\s]?out)/i;
-  for (const m of html.matchAll(re)) {
-    const href = decode(m[1]);
-    const text = m[2].replace(/<[^>]+>/g, " ");
-    if (keywords.test(text) && /^https?:\/\//i.test(href)) {
-      return href;
-    }
-  }
-  return null;
 }
 
 // ============================================================
@@ -371,8 +347,10 @@ function findOrCreateGroup(senderEmail, info, sender) {
 }
 
 // ============================================================
-// FETCH + PROCESS A PAGE
+// FETCH + PROCESS A PAGE (Graph $batch — 20 requêtes par appel)
 // ============================================================
+// On ne récupère QUE les headers (pas le body) : ~2 KB par email au lieu de
+// 50-200 KB. Gain typique : 5-10x plus rapide.
 async function fetchAndProcess(url, folder, token) {
   const data = await callGraph(url, "GET", null, token).catch(err => {
     dbg(`Erreur scan ${folder}: ${err.message}`, "warn");
@@ -383,30 +361,42 @@ async function fetchAndProcess(url, folder, token) {
   const messages = data.value || [];
   dbg(`${folder}: ${messages.length} messages`, "ok");
 
-  const batchSize = 5;
-  for (let i = 0; i < messages.length; i += batchSize) {
-    const batch = messages.slice(i, i + batchSize);
-    const results = await Promise.all(batch.map(msg =>
-      // On inclut body (HTML) pour retomber sur un lien user-friendly quand le
-      // header pointe vers un endpoint API (ex: linear.app/api/unsubscribe = 404 en GET).
-      callGraph(
-        `https://graph.microsoft.com/v1.0/me/messages/${msg.id}?$select=id,subject,from,internetMessageHeaders,body`,
-        "GET", null, token
-      ).then(d => ({ d, folder })).catch(err => { dbg(`Header ${msg.id}: ${err.message}`, "warn"); return null; })
-    ));
-    for (const item of results) {
-      if (!item?.d) continue;
-      const { d, folder: f } = item;
-      const bodyHtml = (d.body && d.body.contentType === "html") ? d.body.content : "";
-      const info = extractUnsubscribeInfo(d.internetMessageHeaders || [], bodyHtml);
-      if (!info.method) continue; // aucune piste de désinscription trouvée
+  const BATCH = 20; // Graph $batch max = 20
+  for (let i = 0; i < messages.length; i += BATCH) {
+    const slice = messages.slice(i, i + BATCH);
+    const requests = slice.map((msg, idx) => ({
+      id: String(idx),
+      method: "GET",
+      url: `/me/messages/${msg.id}?$select=id,subject,from,internetMessageHeaders`
+    }));
+
+    let responses = [];
+    try {
+      const resp = await callGraph(
+        "https://graph.microsoft.com/v1.0/$batch",
+        "POST", { requests }, token
+      );
+      responses = resp.responses || [];
+    } catch (err) {
+      dbg(`Batch ${i}: ${err.message}`, "warn");
+      continue;
+    }
+
+    for (const r of responses) {
+      if (r.status !== 200 || !r.body) {
+        if (r.status === 429) dbg(`Sub-request 429 (throttled) — ignoré`, "warn");
+        continue;
+      }
+      const d = r.body;
+      const info = extractUnsubscribeInfo(d.internetMessageHeaders || []);
+      if (!info.method) continue;
       const senderEmail = d.from?.emailAddress?.address || "";
       const sender      = d.from?.emailAddress?.name || senderEmail || "Inconnu";
       const g = findOrCreateGroup(senderEmail, info, sender);
-      g.folders.add(f);
-      g.emails.push({ id: d.id, subject: d.subject || "(sans objet)", folder: f });
+      g.folders.add(folder);
+      g.emails.push({ id: d.id, subject: d.subject || "(sans objet)", folder });
     }
-    setStatus(`Analyse ${folder}… ${Math.min(i + batchSize, messages.length)}/${messages.length} — ${groups.length} expéditeur(s) trouvé(s)`);
+    setStatus(`Analyse ${folder}… ${Math.min(i + BATCH, messages.length)}/${messages.length} — ${groups.length} expéditeur(s)`);
   }
   return data["@odata.nextLink"] || null;
 }
@@ -510,9 +500,10 @@ function renderResults() {
         ? `<span class="folder-badge junk">Junk</span>`
         : `<span class="folder-badge inbox">Inbox</span>`;
 
-    const displayUrl = group.info.displayUrl || "";
-    const methodIcon = { "one-click": "⚡", "graph-mailto": "✉️", "popup": "🔗" }[group.info.method] || "🔗";
+    const label = group.info.displayLabel || "";
+    const methodIcon  = { "one-click": "⚡", "graph-mailto": "✉️", "popup": "🔗" }[group.info.method] || "🔗";
     const methodLabel = { "one-click": "1-clic", "graph-mailto": "mail auto", "popup": "page web" }[group.info.method] || "";
+    const fullUrl = group.info.oneClickUrl || group.info.httpsUrl || group.info.mailtoUrl || "";
 
     const div = document.createElement("div");
     div.className = "group-item";
@@ -525,7 +516,7 @@ function renderResults() {
           <div class="group-email">${escHtml(group.senderEmail)}</div>
         </div>
       </div>
-      <div class="group-url" title="${escHtml(displayUrl)}">${methodIcon} <span style="color:#605e5c">[${methodLabel}]</span> ${escHtml(displayUrl.substring(0, 55))}${displayUrl.length > 55 ? "…" : ""}</div>
+      <div class="group-url" title="${escHtml(fullUrl)}">${methodIcon} <span style="color:#605e5c">[${methodLabel}]</span> ${escHtml(label)}</div>
       <div class="group-actions">
         <button class="btn-sm unsub">${methodIcon} Se désinscrire</button>
         <button class="btn-sm archive">📦 Archiver (${group.emails.length})</button>
@@ -564,11 +555,15 @@ async function executeUnsubscribe(idx, cardEl, unsubBtn, archiveBtn) {
       dbg(`One-click POST → ${info.oneClickUrl}`);
       const ok = await postOneClickUnsubscribe(info.oneClickUrl);
       if (ok) {
-        setStatus(`✅ Désinscription 1-clic envoyée à ${group.sender} — archivage en cours…`);
+        // Feedback visuel FORT : la carte devient verte, le bouton montre "✅ Désinscrit"
+        // pendant 1.2s avant de lancer l'archivage → l'utilisateur voit clairement que
+        // quelque chose s'est passé (one-click est silencieux sinon).
+        markCardSuccess(cardEl, unsubBtn, `✅ Désinscrit de ${group.sender}`);
+        setStatus(`✅ Désinscription 1-clic envoyée à ${group.sender} — archivage auto dans 1s…`);
+        await new Promise(r => setTimeout(r, 1200));
         await autoArchiveAfterUnsub(idx, cardEl);
         return;
       }
-      // Si le POST a échoué techniquement, on retombe sur popup
       dbg(`One-click POST échoué, fallback popup`, "warn");
     }
 
@@ -582,7 +577,9 @@ async function executeUnsubscribe(idx, cardEl, unsubBtn, archiveBtn) {
           `https://graph.microsoft.com/beta/me/messages/${group.emails[0].id}/unsubscribe`,
           "POST", null, token
         );
-        setStatus(`✅ Mail de désinscription envoyé à ${group.sender} — archivage en cours…`);
+        markCardSuccess(cardEl, unsubBtn, `✅ Mail envoyé`);
+        setStatus(`✅ Mail de désinscription envoyé à ${group.sender} — archivage auto dans 1s…`);
+        await new Promise(r => setTimeout(r, 1200));
         await autoArchiveAfterUnsub(idx, cardEl);
         return;
       } catch (err) {
@@ -645,6 +642,19 @@ function openUrlPopup(url) {
       window.open(url, "_blank");
     }
   } catch (e) { window.open(url, "_blank"); }
+}
+
+// Feedback visuel quand la désinscription a réussi mais qu'il n'y a pas de page à ouvrir
+// (one-click POST ou Graph mailto). Carte verte + badge ✅ pendant 1.2s.
+function markCardSuccess(cardEl, unsubBtn, label) {
+  cardEl.style.transition = "background 0.3s, border-color 0.3s";
+  cardEl.style.background = "#dff6dd";
+  cardEl.style.borderColor = "#107c10";
+  unsubBtn.textContent = label;
+  unsubBtn.style.color = "#107c10";
+  unsubBtn.style.borderColor = "#107c10";
+  unsubBtn.style.background = "#f0fbef";
+  unsubBtn.disabled = true;
 }
 
 // Après une désinscription confirmée (one-click ou Graph mailto), archive les emails
