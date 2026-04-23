@@ -386,6 +386,20 @@ let junkNextLink = null;
 let inboxNextLink = null;
 // Emails scannés sans header List-Unsubscribe (candidats pour body scan)
 let bodyScanCandidates = [];
+// Cache du dossier "Éléments supprimés" résolu une fois via Graph
+// (nom "magique" deleteditems → vrai ID + displayName localisé)
+let deletedItemsFolder = null;
+
+async function getDeletedItemsFolder(token) {
+  if (deletedItemsFolder) return deletedItemsFolder;
+  const resp = await callGraph(
+    `https://graph.microsoft.com/v1.0/me/mailFolders/deleteditems?$select=id,displayName`,
+    "GET", null, token
+  );
+  deletedItemsFolder = { id: resp.id, displayName: resp.displayName };
+  dbg(`Corbeille résolue : "${resp.displayName}" (id: ${resp.id.substring(0, 24)}…)`, "ok");
+  return deletedItemsFolder;
+}
 
 // Extrait le domaine "racine" (2 derniers labels) d'un email pour regrouper
 // les variantes VERP / sous-domaines (bounce-xxx@mail.acme.com → acme.com,
@@ -858,8 +872,11 @@ function markCardSuccess(cardEl, unsubBtn, label) {
 // ============================================================
 // DELETE GROUP (corbeille)
 // ============================================================
-// Déplace vers le dossier "Éléments supprimés" (deleteditems). L'utilisateur peut
-// toujours récupérer depuis la corbeille. Pas de suppression permanente automatique.
+// Flow : /me/messages/{id}/move avec destinationId = ID RÉEL du dossier corbeille
+// (résolu via Graph une fois, localisé). Retourne le message avec son nouveau
+// parentFolderId qu'on VÉRIFIE pour confirmer qu'il a bien atterri. Le client
+// Outlook peut prendre 5-60s pour synchroniser — la confirmation Graph est
+// immédiate et fiable (source de vérité côté Microsoft).
 async function deleteGroup(idx, cardEl, deleteBtn) {
   const group = groups[idx];
   if (!group) return;
@@ -871,14 +888,22 @@ async function deleteGroup(idx, cardEl, deleteBtn) {
     const token = await getToken();
     if (!token) { deleteBtn.disabled = false; deleteBtn.textContent = `🗑️ Supprimer (${group.emails.length})`; return; }
 
-    let ok = 0, errors = 0;
+    const trash = await getDeletedItemsFolder(token);
+    let ok = 0, confirmed = 0, errors = 0;
     for (const email of group.emails) {
       try {
-        await callGraph(
+        // Utilise l'ID résolu (plus fiable que le nom magique "deleteditems" sur certains tenants)
+        const moved = await callGraph(
           `https://graph.microsoft.com/v1.0/me/messages/${email.id}/move`,
-          "POST", { destinationId: "deleteditems" }, token
+          "POST", { destinationId: trash.id }, token
         );
         ok++;
+        if (moved && moved.parentFolderId === trash.id) {
+          confirmed++;
+          dbg(`${email.folder} → ${trash.displayName} ✓ (parentFolderId vérifié)`, "ok");
+        } else {
+          dbg(`⚠️ Move OK mais parentFolderId=${moved?.parentFolderId?.substring(0,24) || "?"} (attendu ${trash.id.substring(0,24)})`, "warn");
+        }
       } catch (e) {
         errors++;
         dbg(`Erreur suppression ${email.id}: ${e.message}`, "err");
@@ -886,11 +911,13 @@ async function deleteGroup(idx, cardEl, deleteBtn) {
     }
 
     if (errors === 0) {
-      // Retirer du state (garder les indices valides)
       groups[idx] = null;
       cardEl.remove();
       updateSummary();
-      setStatus(`✅ ${ok} email(s) de ${group.sender} déplacés dans la corbeille.`);
+      const vm = confirmed === ok
+        ? `✅ ${ok} email(s) de ${group.sender} → "${trash.displayName}" (confirmé côté Microsoft, l'affichage Outlook peut prendre 1 min).`
+        : `✅ ${ok} email(s) déplacés (${confirmed}/${ok} confirmés dans "${trash.displayName}"). Vérifie le debug pour les autres.`;
+      setStatus(vm);
       if (groups.filter(Boolean).length === 0) {
         document.getElementById("results-container").classList.add("hidden");
         setStatus("✅ Tout traité ! Rescannez pour vérifier.");
@@ -898,7 +925,7 @@ async function deleteGroup(idx, cardEl, deleteBtn) {
     } else {
       deleteBtn.disabled = false;
       deleteBtn.textContent = `🗑️ Supprimer (${group.emails.length})`;
-      setStatus(`⚠️ ${ok} supprimés, ${errors} erreur(s). Réessayez.`);
+      setStatus(`⚠️ ${ok} supprimés (${confirmed} confirmés), ${errors} erreur(s). Réessayez.`);
     }
   } catch (err) {
     dbg(`ERREUR SUPPRESSION: ${err.message}`, "err");
@@ -1037,7 +1064,8 @@ document.getElementById("btn-delete-bulk").addEventListener("click", async () =>
 
   btn.disabled = false;
   btn.textContent = originalLabel;
-  setStatus(`✅ ${done} expéditeur(s) envoyé(s) en corbeille.`);
+  const folderName = deletedItemsFolder?.displayName || "la corbeille";
+  setStatus(`✅ ${done} expéditeur(s) déplacés vers "${folderName}" (l'affichage Outlook peut prendre 1 min à se rafraîchir).`);
 });
 
 // ============================================================
