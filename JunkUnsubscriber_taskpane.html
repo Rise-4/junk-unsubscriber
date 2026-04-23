@@ -18,7 +18,7 @@
     #debug-toggle { background: none; border: none; color: rgba(255,255,255,0.3); font-size: 9px; cursor: pointer; padding: 0; margin-top: 2px; line-height: 1; letter-spacing: 0.5px; text-transform: uppercase; font-family: 'Segoe UI', sans-serif; }
     #debug-toggle:hover { color: rgba(255,255,255,0.8); }
 
-    .warning { background: #fff4ce; border-left: 3px solid #f2c94c; padding: 8px 12px; margin: 10px; font-size: 11px; color: #5d4b00; }
+    .disclaimer { margin: 10px; font-size: 10px; color: #a19f9d; line-height: 1.4; }
 
     .btn-primary { display: block; width: calc(100% - 20px); margin: 10px; padding: 10px; background: #0078d4; color: white; border: none; border-radius: 4px; font-size: 13px; font-weight: 600; cursor: pointer; }
     .btn-primary:hover { background: #106ebe; }
@@ -91,10 +91,6 @@
   <button id="debug-toggle" onclick="toggleDebug()" title="Panneau de debug">debug</button>
 </header>
 
-<div class="warning">
-  ⚠️ <strong>Conseil sécurité :</strong> Décochez les expéditeurs que vous ne reconnaissez pas. Se désinscrire d'un vrai spam peut confirmer votre adresse.
-</div>
-
 <div id="scope-bar">
   <label><input type="radio" name="scope" value="both" checked/><span>Les deux</span></label>
   <label><input type="radio" name="scope" value="inbox"/><span>Boîte de réception</span></label>
@@ -119,6 +115,8 @@
     <button class="btn-secondary btn-delete" id="btn-delete-bulk">🗑️ Supprimer (sélectionnés)</button>
   </div>
 </div>
+
+<div class="disclaimer">Certains spams passent à travers (pas de lien détectable, ou format non reconnu). Certains sites ignorent la désinscription automatique et exigent une confirmation sur leur page.</div>
 
 <div id="debug-panel"></div>
 
