@@ -47,8 +47,8 @@
     .btn-sm:disabled { opacity: 0.5; cursor: not-allowed; }
     .btn-sm.unsub   { background: white; color: #0078d4; border: 1px solid #0078d4; }
     .btn-sm.unsub:hover:not(:disabled)   { background: #deecf9; }
-    .btn-sm.archive { background: white; color: #5c2d91; border: 1px solid #5c2d91; }
-    .btn-sm.archive:hover:not(:disabled) { background: #f4eef9; }
+    .btn-sm.delete { background: white; color: #a4262c; border: 1px solid #a4262c; }
+    .btn-sm.delete:hover:not(:disabled) { background: #fde7e9; }
 
     #select-all-bar { display: flex; align-items: center; margin: 0 10px 8px; gap: 6px; font-size: 12px; color: #605e5c; }
     #summary-label  { font-size: 11px; color: #605e5c; }
@@ -61,6 +61,16 @@
     .btn-load-more { width: 100%; padding: 7px; background: #f3f2f1; color: #323130; border: 1px solid #c8c6c4; border-radius: 4px; font-size: 12px; cursor: pointer; }
     .btn-load-more:hover:not(:disabled) { background: #edebe9; }
     .btn-load-more:disabled { opacity: 0.6; cursor: not-allowed; }
+
+    #scope-bar { display: flex; gap: 4px; margin: 10px 10px 0; padding: 3px; background: #f3f2f1; border-radius: 4px; }
+    #scope-bar label { flex: 1; text-align: center; padding: 6px 4px; font-size: 11px; color: #605e5c; cursor: pointer; border-radius: 3px; transition: background 0.15s; user-select: none; }
+    #scope-bar input[type=radio] { display: none; }
+    #scope-bar input[type=radio]:checked + span { color: #0078d4; font-weight: 600; }
+    #scope-bar label:has(input:checked) { background: white; box-shadow: 0 1px 2px rgba(0,0,0,0.08); }
+    #scope-bar label:hover:not(:has(input:checked)) { background: #edebe9; }
+
+    .btn-delete { background: white; color: #a4262c; border: 1px solid #a4262c; }
+    .btn-delete:hover:not(:disabled) { background: #fde7e9; }
 
     .hidden { display: none !important; }
 
@@ -76,7 +86,7 @@
 <header>
   <div class="header-text">
     <h1>🗑️ Junk Unsubscriber</h1>
-    <p>Newsletters — Junk + Boîte de réception</p>
+    <p>Newsletters — détection RFC 8058 + scan du corps</p>
   </div>
   <button id="debug-toggle" onclick="toggleDebug()" title="Panneau de debug">debug</button>
 </header>
@@ -85,7 +95,13 @@
   ⚠️ <strong>Conseil sécurité :</strong> Décochez les expéditeurs que vous ne reconnaissez pas. Se désinscrire d'un vrai spam peut confirmer votre adresse.
 </div>
 
-<button class="btn-primary" id="btn-scan">🔍 Scanner Junk + Boîte de réception</button>
+<div id="scope-bar">
+  <label><input type="radio" name="scope" value="both" checked/><span>Les deux</span></label>
+  <label><input type="radio" name="scope" value="inbox"/><span>Boîte de réception</span></label>
+  <label><input type="radio" name="scope" value="junk"/><span>Indésirables</span></label>
+</div>
+
+<button class="btn-primary" id="btn-scan">🔍 Scanner</button>
 <div id="status"></div>
 
 <div id="results-container" class="hidden">
@@ -100,7 +116,7 @@
   </div>
   <div class="action-bar">
     <button class="btn-secondary" id="btn-unsub-bulk">🔗 Se désinscrire (sélectionnés)</button>
-    <button class="btn-secondary" id="btn-archive-bulk">📦 Archiver (sélectionnés)</button>
+    <button class="btn-secondary btn-delete" id="btn-delete-bulk">🗑️ Supprimer (sélectionnés)</button>
   </div>
 </div>
 
@@ -268,9 +284,11 @@ async function callGraph(url, method, body, token, retries = 3) {
 // Retourne { oneClickUrl, mailtoUrl, httpsUrl, displayLabel, method }
 // - oneClickUrl  : URL à POSTer en RFC 8058 one-click (header + List-Unsubscribe-Post)
 // - mailtoUrl    : mailto: trouvé dans le header (utilisable via Graph /unsubscribe)
-// - httpsUrl     : URL HTTPS du header (fallback popup si pas de one-click)
+// - httpsUrl     : URL HTTPS du header (utilisable en GET silencieux no-cors)
 // - displayLabel : courte description user-friendly (hostname ou adresse mailto)
-// - method       : "one-click" | "graph-mailto" | "popup" | null
+// - method       : "one-click" | "graph-mailto" | "http-auto" | "popup" | null
+//   "http-auto"  : GET silencieux no-cors (lien HTTPS sans garantie RFC 8058 — on tente quand même, fire-and-forget).
+//   "popup"      : ultime recours quand rien d'auto possible (mailto sans Graph, URL suspecte, etc.)
 function extractUnsubscribeInfo(headers) {
   const info = { oneClickUrl: null, mailtoUrl: null, httpsUrl: null, displayLabel: "", method: null };
   const hs = Array.isArray(headers) ? headers : [];
@@ -302,21 +320,74 @@ function extractUnsubscribeInfo(headers) {
     info.displayLabel = info.mailtoUrl.replace(/^mailto:/i, "").split("?")[0];
   }
 
+  // Ordre par fiabilité : RFC 8058 garanti > Graph mailto (silent, géré par Microsoft) > GET silencieux
   if (info.oneClickUrl)      info.method = "one-click";
   else if (info.mailtoUrl)   info.method = "graph-mailto";
-  else if (info.httpsUrl)    info.method = "popup";
+  else if (info.httpsUrl)    info.method = "http-auto";
   return info;
+}
+
+// ============================================================
+// BODY SCAN (emails sans header List-Unsubscribe)
+// ============================================================
+// ~15-25% des newsletters légitimes (Substack ancien, PME, prospection FR/EN)
+// n'implémentent pas RFC 2369. Le lien de désinscription n'existe que dans le corps.
+// On utilise method "http-auto" → GET silencieux no-cors (fire-and-forget, safe, pas de popup).
+const UNSUB_TEXT_RE = /(unsubscribe|désinscri[pt]|désabonn|opt[- ]?out|manage\s+(email|subscription)?\s*preferences?|ne\s+plus\s+recevoir|gérer\s+(mes|vos)\s+préférences|stop\s+receiving|remove\s+me)/i;
+// Heuristique : expéditeur qui "sent la newsletter" (évite de scanner les emails perso).
+// Capture les patterns fréquents : noreply@, newsletter@, info@, bonjour@, hello@, etc.
+const NEWSLETTER_SENDER_RE = /(^|[._@-])(no-?reply|newsletter|news|mailing|notifications?|hello|bonjour|contact|info|bounce|announce|updates?|digest|team|support|marketing|communication|press|welcome|equipe|contact-?us)([._@-]|$)/i;
+
+function extractBodyUnsubLink(body) {
+  if (!body || !body.content) return null;
+  const content = body.content;
+  // HTML : ancres <a href="URL">texte</a> dont le texte contient un mot-clé unsub
+  if (body.contentType === "html") {
+    const re = /<a\s+[^>]*href=["']([^"']+)["'][^>]*>([\s\S]{0,300}?)<\/a>/gi;
+    let m;
+    while ((m = re.exec(content)) !== null) {
+      const href = m[1];
+      if (!/^https?:\/\//i.test(href)) continue;
+      const text = m[2].replace(/<[^>]+>/g, " ").replace(/&[a-z#0-9]+;/gi, " ");
+      if (UNSUB_TEXT_RE.test(text)) return href;
+    }
+    // Fallback : certains mails sont en HTML mais liens en format texte brut
+    // (ex: Outlook qui convertit HTML→Plain en transit)
+    const plain = content.replace(/<[^>]+>/g, " ");
+    const mt = plain.match(/(?:unsubscribe|désinscri[pt]\w*|désabonn\w*|opt[- ]?out|ne\s+plus\s+recevoir)[\s\S]{0,80}?(https?:\/\/[^\s<>"')]+)/i);
+    if (mt) return mt[1];
+    return null;
+  }
+  // Text brut : "Unsubscribe <https://...>" ou "Désinscription https://..."
+  const re = /(?:unsubscribe|désinscri[pt]\w*|désabonn\w*|opt[- ]?out|ne\s+plus\s+recevoir)[\s\S]{0,80}?<?(https?:\/\/[^\s>"')]+)>?/i;
+  const m = content.match(re);
+  return m ? m[1] : null;
+}
+
+function looksLikeNewsletterSender(senderEmail, senderName) {
+  const e = (senderEmail || "").toLowerCase();
+  const n = (senderName || "").toLowerCase();
+  if (NEWSLETTER_SENDER_RE.test(e)) return true;
+  if (NEWSLETTER_SENDER_RE.test(n)) return true;
+  // Prénoms/noms simples d'humain : prenom.nom@, prenom_nom@ → exclure
+  const local = e.split("@")[0] || "";
+  if (/^[a-zéèêàçùâîô]+[._-][a-zéèêàçùâîô]+$/i.test(local) && local.length < 30) return false;
+  // Default : candidat si local part contient chiffres (tracking IDs, envois en masse)
+  if (/\d{3,}/.test(local)) return true;
+  return false;
 }
 
 // ============================================================
 // STATE
 // ============================================================
 // Groups indexed by integer (avoids CSS selector escaping issues)
-// { key, sender, senderEmail, info: {oneClickUrl, mailtoUrl, httpsUrl, bodyUrl, displayUrl, method},
+// { key, sender, senderEmail, info: {oneClickUrl, mailtoUrl, httpsUrl, displayLabel, method, source},
 //   folders: Set, emails: [{id, subject, folder}] }
 let groups = [];
 let junkNextLink = null;
 let inboxNextLink = null;
+// Emails scannés sans header List-Unsubscribe (candidats pour body scan)
+let bodyScanCandidates = [];
 
 // Extrait le domaine "racine" (2 derniers labels) d'un email pour regrouper
 // les variantes VERP / sous-domaines (bounce-xxx@mail.acme.com → acme.com,
@@ -339,8 +410,8 @@ function findOrCreateGroup(senderEmail, info, sender) {
     groups.push(g);
   } else {
     // Upgrade l'info si le nouvel email fournit une méthode meilleure
-    // (one-click > graph-mailto > popup)
-    const rank = { "one-click": 3, "graph-mailto": 2, "popup": 1 };
+    // (one-click > graph-mailto > http-auto > popup)
+    const rank = { "one-click": 4, "graph-mailto": 3, "http-auto": 2, "popup": 1 };
     if ((rank[info.method] || 0) > (rank[g.info.method] || 0)) g.info = info;
   }
   return g;
@@ -382,12 +453,69 @@ async function fetchAndProcess(url, folder, token) {
 
 function processMessageIntoGroups(d, folder) {
   const info = extractUnsubscribeInfo(d.internetMessageHeaders || []);
-  if (!info.method) return;
   const senderEmail = d.from?.emailAddress?.address || "";
   const sender      = d.from?.emailAddress?.name || senderEmail || "Inconnu";
+  if (!info.method) {
+    // Pas de header → candidat pour body scan (si ça ressemble à une newsletter)
+    if (senderEmail && looksLikeNewsletterSender(senderEmail, sender)) {
+      bodyScanCandidates.push({ id: d.id, folder, senderEmail, sender, subject: d.subject });
+    }
+    return;
+  }
+  info.source = "header";
   const g = findOrCreateGroup(senderEmail, info, sender);
   g.folders.add(folder);
   g.emails.push({ id: d.id, subject: d.subject || "(sans objet)", folder });
+}
+
+// Scan le body des candidats (emails sans header, from "newsletter-like").
+// $batch de 20, 3 vagues concurrentes. Plafonné à 100 pour maîtriser la perf.
+async function scanBodiesForUnsubLinks(candidates, token) {
+  if (!candidates || candidates.length === 0) return;
+  const MAX = 100;
+  const slice = candidates.slice(0, MAX);
+  if (candidates.length > MAX) {
+    dbg(`Body scan : ${slice.length}/${candidates.length} (plafond ${MAX})`, "warn");
+  } else {
+    dbg(`Body scan : ${slice.length} candidat(s) sans header`);
+  }
+
+  const BATCH = 20, CONCURRENCY = 3;
+  const batches = [];
+  for (let i = 0; i < slice.length; i += BATCH) batches.push(slice.slice(i, i + BATCH));
+
+  let found = 0;
+  for (let i = 0; i < batches.length; i += CONCURRENCY) {
+    const wave = batches.slice(i, i + CONCURRENCY);
+    await Promise.all(wave.map(async chunk => {
+      const requests = chunk.map((c, idx) => ({
+        id: String(idx),
+        method: "GET",
+        url: `/me/messages/${c.id}?$select=id,body`
+      }));
+      try {
+        const resp = await callGraph("https://graph.microsoft.com/v1.0/$batch", "POST", { requests }, token);
+        for (const r of (resp.responses || [])) {
+          if (r.status !== 200 || !r.body) continue;
+          const cand = chunk[parseInt(r.id)];
+          if (!cand) continue;
+          const url = extractBodyUnsubLink(r.body.body);
+          if (!url) continue;
+          const info = {
+            oneClickUrl: null, mailtoUrl: null, httpsUrl: url,
+            displayLabel: "", method: "http-auto", source: "body"
+          };
+          try { info.displayLabel = new URL(url).hostname; }
+          catch { info.displayLabel = url.substring(0, 40); }
+          const g = findOrCreateGroup(cand.senderEmail, info, cand.sender);
+          g.folders.add(cand.folder);
+          g.emails.push({ id: cand.id, subject: cand.subject || "(sans objet)", folder: cand.folder });
+          found++;
+        }
+      } catch (err) { dbg(`Body batch: ${err.message}`, "warn"); }
+    }));
+  }
+  dbg(`Body scan : ${found} lien(s) trouvé(s) dans le corps`, found > 0 ? "ok" : "info");
 }
 
 // Fallback $batch. On parallélise jusqu'à 3 batches simultanés pour rester sous
@@ -431,6 +559,7 @@ document.getElementById("btn-scan").addEventListener("click", async () => {
   groups = [];
   junkNextLink = null;
   inboxNextLink = null;
+  bodyScanCandidates = [];
 
   try {
     const token = await getToken();
@@ -439,18 +568,29 @@ document.getElementById("btn-scan").addEventListener("click", async () => {
     setStatus("Scan en cours...");
     // $select=internetMessageHeaders évite un second passage $batch — un seul appel suffit.
     const SELECT = "id,subject,from,internetMessageHeaders";
+    const scope = document.querySelector('input[name="scope"]:checked')?.value || "both";
+    const scanJunk  = scope === "both" || scope === "junk";
+    const scanInbox = scope === "both" || scope === "inbox";
+    dbg(`Scan scope: ${scope}`);
     const [junkNext, inboxNext] = await Promise.all([
-      fetchAndProcess(
+      scanJunk ? fetchAndProcess(
         `https://graph.microsoft.com/v1.0/me/mailFolders/junkemail/messages?$top=${PAGE_SIZE}&$select=${SELECT}`,
         "junk", token
-      ),
-      fetchAndProcess(
+      ) : Promise.resolve(null),
+      scanInbox ? fetchAndProcess(
         `https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?$top=${PAGE_SIZE}&$select=${SELECT}`,
         "inbox", token
-      )
+      ) : Promise.resolve(null)
     ]);
     junkNextLink  = junkNext;
     inboxNextLink = inboxNext;
+
+    // Body scan : récupère le corps des emails sans header qui ressemblent à des newsletters
+    if (bodyScanCandidates.length > 0) {
+      setStatus(`🔎 Analyse du corps de ${Math.min(bodyScanCandidates.length, 100)} email(s)...`);
+      await scanBodiesForUnsubLinks(bodyScanCandidates, token);
+      bodyScanCandidates = [];
+    }
 
     if (groups.length === 0) {
       const total = groups.reduce((n, g) => n + g.emails.length, 0);
@@ -486,6 +626,12 @@ document.getElementById("btn-load-more").addEventListener("click", async () => {
       junkNextLink  ? fetchAndProcess(junkNextLink,  "junk",  token).then(nl => junkNextLink  = nl) : null,
       inboxNextLink ? fetchAndProcess(inboxNextLink, "inbox", token).then(nl => inboxNextLink = nl) : null,
     ]);
+    // Body scan pour la nouvelle page aussi
+    if (bodyScanCandidates.length > 0) {
+      setStatus(`🔎 Analyse du corps de ${Math.min(bodyScanCandidates.length, 100)} email(s)...`);
+      await scanBodiesForUnsubLinks(bodyScanCandidates, token);
+      bodyScanCandidates = [];
+    }
     renderResults();
     updateLoadMore();
     setStatus("");
@@ -521,8 +667,8 @@ function renderResults() {
         : `<span class="folder-badge inbox">Inbox</span>`;
 
     const label = group.info.displayLabel || "";
-    const methodIcon  = { "one-click": "⚡", "graph-mailto": "✉️", "popup": "🔗" }[group.info.method] || "🔗";
-    const methodLabel = { "one-click": "1-clic", "graph-mailto": "mail auto", "popup": "page web" }[group.info.method] || "";
+    const methodIcon  = { "one-click": "⚡", "graph-mailto": "✉️", "http-auto": "🤫", "popup": "🔗" }[group.info.method] || "🔗";
+    const methodLabel = { "one-click": "1-clic RFC 8058", "graph-mailto": "mail auto", "http-auto": "GET silencieux", "popup": "page web" }[group.info.method] || "";
     const fullUrl = group.info.oneClickUrl || group.info.httpsUrl || group.info.mailtoUrl || "";
 
     const div = document.createElement("div");
@@ -539,14 +685,14 @@ function renderResults() {
       <div class="group-url" title="${escHtml(fullUrl)}">${methodIcon} <span style="color:#605e5c">[${methodLabel}]</span> ${escHtml(label)}</div>
       <div class="group-actions">
         <button class="btn-sm unsub">${methodIcon} Se désinscrire</button>
-        <button class="btn-sm archive">📦 Archiver (${group.emails.length})</button>
+        <button class="btn-sm delete">🗑️ Supprimer (${group.emails.length})</button>
       </div>`;
 
     const unsubBtn  = div.querySelector(".btn-sm.unsub");
-    const archiveBtn = div.querySelector(".btn-sm.archive");
+    const deleteBtn = div.querySelector(".btn-sm.delete");
 
-    unsubBtn.addEventListener("click",  () => executeUnsubscribe(idx, div, unsubBtn, archiveBtn));
-    archiveBtn.addEventListener("click", () => archiveGroup(idx, div, archiveBtn));
+    unsubBtn.addEventListener("click",  () => executeUnsubscribe(idx, div, unsubBtn, deleteBtn));
+    deleteBtn.addEventListener("click", () => deleteGroup(idx, div, deleteBtn));
 
     container.appendChild(div);
   });
@@ -555,13 +701,15 @@ function renderResults() {
 }
 
 // ============================================================
-// EXECUTE UNSUBSCRIBE (RFC 8058)
+// EXECUTE UNSUBSCRIBE (RFC 8058 + fallbacks silencieux)
 // ============================================================
-// Stratégie par ordre de préférence :
-//   1. one-click POST (RFC 8058) — silencieux, pas de popup, auto-archive ensuite
-//   2. Graph /unsubscribe (mailto) — Graph envoie le mail de désabonnement
-//   3. popup sur l'URL user-friendly (body) ou HTTPS du header — user doit cliquer
-async function executeUnsubscribe(idx, cardEl, unsubBtn, archiveBtn) {
+// Stratégie par ordre de fiabilité (aucune n'ouvre de popup sauf dernier recours) :
+//   1. one-click POST (RFC 8058) — POST "List-Unsubscribe=One-Click", garanti par le sender
+//   2. Graph /unsubscribe (mailto) — Graph envoie le mail de désabonnement côté Microsoft
+//   3. http-auto GET silencieux (no-cors) — on tape l'URL cliquable du header/body,
+//      fire-and-forget. Couvre les senders sans RFC 8058 et les liens trouvés dans le body.
+//   4. popup (ultime recours) — uniquement si aucune URL HTTPS exploitable n'existe
+async function executeUnsubscribe(idx, cardEl, unsubBtn, deleteBtn) {
   const group = groups[idx];
   if (!group) return;
   const info = group.info;
@@ -575,14 +723,11 @@ async function executeUnsubscribe(idx, cardEl, unsubBtn, archiveBtn) {
       dbg(`One-click POST → ${info.oneClickUrl}`);
       const ok = await postOneClickUnsubscribe(info.oneClickUrl);
       if (ok) {
-        // Feedback visuel : carte verte + bouton "✅ Désinscrit" (le one-click est
-        // silencieux côté serveur, sans ça on ne verrait rien).
-        // La carte reste visible — le bouton Archiver est séparé, à la main de l'user.
         markCardSuccess(cardEl, unsubBtn, `✅ Désinscrit`);
-        setStatus(`✅ Désinscription envoyée à ${group.sender}. Clique 📦 Archiver pour nettoyer les ${group.emails.length} email(s) existants.`);
+        setStatus(`✅ ${group.sender} : désinscription one-click envoyée. Clique 🗑️ Supprimer pour jeter les ${group.emails.length} email(s).`);
         return;
       }
-      dbg(`One-click POST échoué, fallback popup`, "warn");
+      dbg(`One-click POST échoué, fallback GET silencieux`, "warn");
     }
 
     // --- Méthode 2 : Graph /unsubscribe (mailto) ---
@@ -595,27 +740,43 @@ async function executeUnsubscribe(idx, cardEl, unsubBtn, archiveBtn) {
           `https://graph.microsoft.com/beta/me/messages/${group.emails[0].id}/unsubscribe`,
           "POST", null, token
         );
-        markCardSuccess(cardEl, unsubBtn, `✅ Mail envoyé`);
-        setStatus(`✅ Mail de désinscription envoyé à ${group.sender}. Clique 📦 Archiver pour nettoyer les ${group.emails.length} email(s) existants.`);
+        markCardSuccess(cardEl, unsubBtn, `✅ Désinscrit`);
+        setStatus(`✅ ${group.sender} : mail de désinscription envoyé. Clique 🗑️ Supprimer pour jeter les ${group.emails.length} email(s).`);
         return;
       } catch (err) {
-        dbg(`Graph /unsubscribe ERREUR: ${err.message} — fallback popup`, "warn");
+        dbg(`Graph /unsubscribe ERREUR: ${err.message} — fallback GET silencieux`, "warn");
       }
     }
 
-    // --- Méthode 3 : popup (user clique lui-même) ---
-    const url = info.bodyUrl || info.httpsUrl || info.mailtoUrl;
+    // --- Méthode 3 : GET silencieux no-cors (http-auto, ou fallback des méthodes 1/2) ---
+    // Inclut aussi les URL trouvées dans le body (source="body") et les URL HTTPS de header
+    // sans List-Unsubscribe-Post. On ne peut pas vérifier le code retour mais la requête part.
+    const httpUrl = info.httpsUrl || info.oneClickUrl;
+    if (httpUrl) {
+      dbg(`GET silencieux → ${httpUrl}`);
+      const ok = await silentGetUnsubscribe(httpUrl);
+      if (ok) {
+        markCardSuccess(cardEl, unsubBtn, `✅ Désinscrit`);
+        const src = info.source === "body" ? " (lien trouvé dans le corps)" : "";
+        setStatus(`✅ ${group.sender}${src} : désinscription envoyée. Clique 🗑️ Supprimer pour jeter les ${group.emails.length} email(s).`);
+        return;
+      }
+      dbg(`GET silencieux échoué — fallback popup`, "warn");
+    }
+
+    // --- Méthode 4 : popup (ultime recours, rien d'auto possible) ---
+    const url = info.httpsUrl || info.mailtoUrl;
     if (!url) {
       setStatus(`❌ Aucune méthode de désinscription trouvée pour ${group.sender}.`);
       unsubBtn.disabled = false;
       unsubBtn.textContent = origLabel;
       return;
     }
-    dbg(`Popup → ${url}`);
+    dbg(`Popup (dernier recours) → ${url}`);
     openUrlPopup(url);
     setStatus(`🔗 Page de désinscription ouverte pour ${group.sender}. Finalise dans l'onglet.`);
     unsubBtn.disabled = false;
-    unsubBtn.textContent = "✓ Ouvert — archiver ?";
+    unsubBtn.textContent = "✓ Ouvert — supprimer ?";
   } catch (err) {
     dbg(`ERREUR executeUnsubscribe: ${err.message}`, "err");
     setStatus(`❌ Erreur : ${err.message}`);
@@ -624,22 +785,44 @@ async function executeUnsubscribe(idx, cardEl, unsubBtn, archiveBtn) {
   }
 }
 
-// POST one-click RFC 8058. Mode no-cors : fire-and-forget.
-// Le serveur traite la requête (DKIM + token suffisent), on ne peut pas lire la réponse
-// depuis un iframe Office. Retourne true si la requête est partie sans erreur réseau.
+// POST one-click RFC 8058. no-cors → réponse opaque, on ne peut pas lire le statut.
+// Retourne true tant que le fetch ne throw pas (pas d'erreur DNS/TLS).
 async function postOneClickUnsubscribe(url) {
   try {
     await fetch(url, {
       method: "POST",
       mode: "no-cors",
       credentials: "omit",
+      referrerPolicy: "no-referrer",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: "List-Unsubscribe=One-Click"
     });
-    dbg(`One-click POST envoyé (no-cors, réponse opaque)`, "ok");
+    dbg(`One-click POST envoyé (no-cors, opaque)`, "ok");
     return true;
   } catch (e) {
     dbg(`One-click POST erreur réseau: ${e.message}`, "err");
+    return false;
+  }
+}
+
+// GET silencieux no-cors sur l'URL de désinscription. Fire-and-forget.
+// Couvre : (a) liens HTTPS du header sans List-Unsubscribe-Post,
+//          (b) liens extraits du body (Podim, Edissio, etc.).
+// Beaucoup de providers (ActiveCampaign, Mailjet, Brevo, Ennelle…) désinscrivent
+// sur un simple GET. Pour les providers à double-confirmation, l'email réapparaîtra
+// au prochain scan — l'user refera l'action.
+async function silentGetUnsubscribe(url) {
+  try {
+    await fetch(url, {
+      method: "GET",
+      mode: "no-cors",
+      credentials: "omit",
+      referrerPolicy: "no-referrer"
+    });
+    dbg(`GET silencieux envoyé (no-cors, opaque)`, "ok");
+    return true;
+  } catch (e) {
+    dbg(`GET silencieux erreur réseau: ${e.message}`, "err");
     return false;
   }
 }
@@ -675,66 +858,55 @@ function markCardSuccess(cardEl, unsubBtn, label) {
 }
 
 // ============================================================
-// ARCHIVE GROUP
+// DELETE GROUP (corbeille)
 // ============================================================
-async function archiveGroup(idx, cardEl, archiveBtn) {
+// Déplace vers le dossier "Éléments supprimés" (deleteditems). L'utilisateur peut
+// toujours récupérer depuis la corbeille. Pas de suppression permanente automatique.
+async function deleteGroup(idx, cardEl, deleteBtn) {
   const group = groups[idx];
   if (!group) return;
 
-  archiveBtn.disabled = true;
-  archiveBtn.textContent = "⏳…";
+  deleteBtn.disabled = true;
+  deleteBtn.textContent = "⏳…";
 
   try {
     const token = await getToken();
-    if (!token) { archiveBtn.disabled = false; archiveBtn.textContent = `📦 Archiver (${group.emails.length})`; return; }
+    if (!token) { deleteBtn.disabled = false; deleteBtn.textContent = `🗑️ Supprimer (${group.emails.length})`; return; }
 
-    let ok = 0, fallback = 0, errors = 0;
+    let ok = 0, errors = 0;
     for (const email of group.emails) {
       try {
         await callGraph(
           `https://graph.microsoft.com/v1.0/me/messages/${email.id}/move`,
-          "POST", { destinationId: "archive" }, token
+          "POST", { destinationId: "deleteditems" }, token
         );
         ok++;
       } catch (e) {
-        // Fallback : déplacer vers la corbeille si le dossier Archive n'existe pas
-        try {
-          await callGraph(
-            `https://graph.microsoft.com/v1.0/me/messages/${email.id}/move`,
-            "POST", { destinationId: "deleteditems" }, token
-          );
-          fallback++;
-          dbg(`Archivé dans corbeille (fallback): ${email.id}`, "warn");
-        } catch (e2) {
-          errors++;
-          dbg(`Erreur archive ${email.id}: ${e2.message}`, "err");
-        }
+        errors++;
+        dbg(`Erreur suppression ${email.id}: ${e.message}`, "err");
       }
     }
 
     if (errors === 0) {
-      const msg = fallback > 0
-        ? `✅ ${ok + fallback} email(s) de ${group.sender} déplacés (${fallback} en corbeille, pas d'archive).`
-        : `✅ ${ok} email(s) de ${group.sender} archivés.`;
       // Retirer du state (garder les indices valides)
       groups[idx] = null;
       cardEl.remove();
       updateSummary();
-      setStatus(msg);
+      setStatus(`✅ ${ok} email(s) de ${group.sender} déplacés dans la corbeille.`);
       if (groups.filter(Boolean).length === 0) {
         document.getElementById("results-container").classList.add("hidden");
         setStatus("✅ Tout traité ! Rescannez pour vérifier.");
       }
     } else {
-      archiveBtn.disabled = false;
-      archiveBtn.textContent = `📦 Archiver (${group.emails.length})`;
-      setStatus(`⚠️ ${ok + fallback} archivés, ${errors} erreur(s). Réessayez.`);
+      deleteBtn.disabled = false;
+      deleteBtn.textContent = `🗑️ Supprimer (${group.emails.length})`;
+      setStatus(`⚠️ ${ok} supprimés, ${errors} erreur(s). Réessayez.`);
     }
   } catch (err) {
-    dbg(`ERREUR ARCHIVE: ${err.message}`, "err");
+    dbg(`ERREUR SUPPRESSION: ${err.message}`, "err");
     setStatus(`❌ Erreur : ${err.message}`);
-    archiveBtn.disabled = false;
-    archiveBtn.textContent = `📦 Archiver (${group.emails.length})`;
+    deleteBtn.disabled = false;
+    deleteBtn.textContent = `🗑️ Supprimer (${group.emails.length})`;
   }
 }
 
@@ -756,10 +928,9 @@ document.getElementById("select-all").addEventListener("change", function() {
 // BULK UNSUBSCRIBE (sélectionnés)
 // ============================================================
 // Stratégie :
-//   - one-click  : POST en parallèle (silencieux), puis auto-archive
-//   - graph-mail : Graph /unsubscribe séquentiel (évite le throttling), puis auto-archive
-//   - popup      : impossible en masse (popup blocker + dialog Office unique) —
-//                  on prévient l'utilisateur et il les fait un par un
+//   - one-click + http-auto : fetch no-cors en parallèle (silencieux, rapide)
+//   - graph-mailto          : Graph /unsubscribe séquentiel (évite le throttling)
+//   - popup                 : impossible en masse, on prévient l'utilisateur
 document.getElementById("btn-unsub-bulk").addEventListener("click", async () => {
   const btn = document.getElementById("btn-unsub-bulk");
   const checked = [...document.querySelectorAll(".group-checkbox:checked")].map(cb => parseInt(cb.dataset.idx));
@@ -769,14 +940,15 @@ document.getElementById("btn-unsub-bulk").addEventListener("click", async () => 
   const origLabel = btn.textContent;
 
   const oneClickIdx = checked.filter(i => groups[i]?.info.method === "one-click");
+  const httpAutoIdx = checked.filter(i => groups[i]?.info.method === "http-auto");
   const mailtoIdx   = checked.filter(i => groups[i]?.info.method === "graph-mailto");
   const popupIdx    = checked.filter(i => groups[i]?.info.method === "popup");
 
-  dbg(`Bulk : ${oneClickIdx.length} one-click, ${mailtoIdx.length} mailto, ${popupIdx.length} popup`);
+  dbg(`Bulk : ${oneClickIdx.length} one-click, ${httpAutoIdx.length} http-auto, ${mailtoIdx.length} mailto, ${popupIdx.length} popup`);
 
   let ok = 0, errors = 0;
 
-  // --- 1-clic en parallèle ---
+  // --- 1-clic RFC 8058 en parallèle ---
   if (oneClickIdx.length > 0) {
     btn.textContent = `⏳ 1-clic (${oneClickIdx.length})…`;
     const results = await Promise.all(oneClickIdx.map(i =>
@@ -785,7 +957,6 @@ document.getElementById("btn-unsub-bulk").addEventListener("click", async () => 
     for (const { i, r } of results) {
       if (r) {
         ok++;
-        // Feedback visuel sur chaque carte désinscrite
         const card = document.querySelector(`.group-item[data-idx="${i}"]`);
         const unsubBtn = card?.querySelector(".btn-sm.unsub");
         if (card && unsubBtn) markCardSuccess(card, unsubBtn, `✅ Désinscrit`);
@@ -793,7 +964,23 @@ document.getElementById("btn-unsub-bulk").addEventListener("click", async () => 
     }
   }
 
-  // --- mailto via Graph (séquentiel) ---
+  // --- GET silencieux en parallèle (headers sans RFC 8058 + liens body) ---
+  if (httpAutoIdx.length > 0) {
+    btn.textContent = `⏳ GET silencieux (${httpAutoIdx.length})…`;
+    const results = await Promise.all(httpAutoIdx.map(i =>
+      silentGetUnsubscribe(groups[i].info.httpsUrl).then(r => ({ i, r }))
+    ));
+    for (const { i, r } of results) {
+      if (r) {
+        ok++;
+        const card = document.querySelector(`.group-item[data-idx="${i}"]`);
+        const unsubBtn = card?.querySelector(".btn-sm.unsub");
+        if (card && unsubBtn) markCardSuccess(card, unsubBtn, `✅ Désinscrit`);
+      } else { errors++; }
+    }
+  }
+
+  // --- mailto via Graph (séquentiel pour éviter le throttling sendMail) ---
   if (mailtoIdx.length > 0) {
     try {
       const token = await getToken();
@@ -808,20 +995,20 @@ document.getElementById("btn-unsub-bulk").addEventListener("click", async () => 
             ok++;
             const card = document.querySelector(`.group-item[data-idx="${i}"]`);
             const unsubBtn = card?.querySelector(".btn-sm.unsub");
-            if (card && unsubBtn) markCardSuccess(card, unsubBtn, `✅ Mail envoyé`);
+            if (card && unsubBtn) markCardSuccess(card, unsubBtn, `✅ Désinscrit`);
           } catch (e) { errors++; dbg(`Graph /unsubscribe ${i}: ${e.message}`, "err"); }
         }
       }
     } catch (e) { dbg(`Bulk mailto token: ${e.message}`, "err"); }
   }
 
-  // --- Popup : impossible en masse, on explique ---
+  // --- Popup : rare maintenant (seulement si rien d'auto), traité un par un ---
   let msg = `✅ ${ok} désinscription(s) envoyée(s)`;
   if (errors > 0) msg += `, ${errors} erreur(s)`;
   if (popupIdx.length > 0) {
     msg += `. ⚠️ ${popupIdx.length} expéditeur(s) nécessitent une page web — clique "Se désinscrire" sur chacun.`;
   }
-  if (ok > 0) msg += ` Utilise 📦 Archiver (sélectionnés) pour nettoyer les emails existants.`;
+  if (ok > 0) msg += ` Utilise 🗑️ Supprimer (sélectionnés) pour jeter les emails existants.`;
   setStatus(msg);
 
   btn.disabled = false;
@@ -829,30 +1016,30 @@ document.getElementById("btn-unsub-bulk").addEventListener("click", async () => 
 });
 
 // ============================================================
-// BULK ARCHIVE (sélectionnés)
+// BULK DELETE (sélectionnés → corbeille)
 // ============================================================
-document.getElementById("btn-archive-bulk").addEventListener("click", async () => {
-  const btn = document.getElementById("btn-archive-bulk");
+document.getElementById("btn-delete-bulk").addEventListener("click", async () => {
+  const btn = document.getElementById("btn-delete-bulk");
   const checkedIdx = [...document.querySelectorAll(".group-checkbox:checked")].map(cb => parseInt(cb.dataset.idx));
   if (checkedIdx.length === 0) { setStatus("Sélectionnez au moins un expéditeur."); return; }
 
   btn.disabled = true;
   const originalLabel = btn.textContent;
-  btn.textContent = "⏳ Archivage...";
+  btn.textContent = "⏳ Suppression...";
 
   let done = 0;
   for (const idx of checkedIdx) {
     const card = document.querySelector(`.group-item[data-idx="${idx}"]`);
-    const archiveBtn = card?.querySelector(".btn-sm.archive");
-    if (!card || !archiveBtn) continue;
-    await archiveGroup(idx, card, archiveBtn);
+    const deleteBtn = card?.querySelector(".btn-sm.delete");
+    if (!card || !deleteBtn) continue;
+    await deleteGroup(idx, card, deleteBtn);
     done++;
-    setStatus(`📦 Archivage... ${done}/${checkedIdx.length}`);
+    setStatus(`🗑️ Suppression... ${done}/${checkedIdx.length}`);
   }
 
   btn.disabled = false;
   btn.textContent = originalLabel;
-  setStatus(`✅ ${done} expéditeur(s) archivé(s).`);
+  setStatus(`✅ ${done} expéditeur(s) envoyé(s) en corbeille.`);
 });
 
 // ============================================================
