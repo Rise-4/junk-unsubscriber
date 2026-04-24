@@ -890,6 +890,7 @@ async function deleteGroup(idx, cardEl, deleteBtn) {
 
     const trash = await getDeletedItemsFolder(token);
     let ok = 0, confirmed = 0, errors = 0;
+    const movedSubjects = [];
     for (const email of group.emails) {
       try {
         // Utilise l'ID résolu (plus fiable que le nom magique "deleteditems" sur certains tenants)
@@ -900,7 +901,8 @@ async function deleteGroup(idx, cardEl, deleteBtn) {
         ok++;
         if (moved && moved.parentFolderId === trash.id) {
           confirmed++;
-          dbg(`${email.folder} → ${trash.displayName} ✓ (parentFolderId vérifié)`, "ok");
+          movedSubjects.push(email.subject);
+          dbg(`${email.folder} → ${trash.displayName} ✓ : "${email.subject}"`, "ok");
         } else {
           dbg(`⚠️ Move OK mais parentFolderId=${moved?.parentFolderId?.substring(0,24) || "?"} (attendu ${trash.id.substring(0,24)})`, "warn");
         }
@@ -910,12 +912,37 @@ async function deleteGroup(idx, cardEl, deleteBtn) {
       }
     }
 
+    // Sonde post-move : liste les 5 derniers messages du dossier corbeille pour
+    // PROUVER que les emails y sont (côté Graph, serveur Microsoft).
+    // Si Outlook client n'affiche pas, c'est un pur problème de sync → Ctrl+F5.
+    if (confirmed > 0) {
+      try {
+        const probe = await callGraph(
+          `https://graph.microsoft.com/v1.0/me/mailFolders/${trash.id}/messages?$top=5&$select=id,subject,lastModifiedDateTime&$orderby=lastModifiedDateTime desc`,
+          "GET", null, token
+        );
+        const items = probe.value || [];
+        dbg(`📋 Sonde "${trash.displayName}" — 5 plus récents :`, "info");
+        const movedSet = new Set(movedSubjects);
+        let foundCount = 0;
+        for (const it of items) {
+          const here = movedSet.has(it.subject) ? "  ← VIENT D'ÊTRE DÉPLACÉ" : "";
+          if (here) foundCount++;
+          const ts = new Date(it.lastModifiedDateTime).toLocaleTimeString("fr-FR");
+          dbg(`   [${ts}] "${it.subject}"${here}`);
+        }
+        dbg(`📋 Preuve : ${foundCount}/${confirmed} emails déplacés retrouvés dans "${trash.displayName}"`, foundCount === confirmed ? "ok" : "warn");
+      } catch (e) {
+        dbg(`Sonde corbeille : ${e.message}`, "warn");
+      }
+    }
+
     if (errors === 0) {
       groups[idx] = null;
       cardEl.remove();
       updateSummary();
       const vm = confirmed === ok
-        ? `✅ ${ok} email(s) de ${group.sender} → "${trash.displayName}" (confirmé côté Microsoft, l'affichage Outlook peut prendre 1 min).`
+        ? `✅ ${ok} email(s) de ${group.sender} → "${trash.displayName}" (Graph confirme). Non visibles dans Outlook ? Ctrl+F5 ou clique ⟳ refresh (le client peut traîner 1 min). Debug → sonde serveur.`
         : `✅ ${ok} email(s) déplacés (${confirmed}/${ok} confirmés dans "${trash.displayName}"). Vérifie le debug pour les autres.`;
       setStatus(vm);
       if (groups.filter(Boolean).length === 0) {
