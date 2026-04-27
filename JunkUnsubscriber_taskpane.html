@@ -362,6 +362,9 @@ function extractBodyUnsubLink(body) {
   return m ? m[1] : null;
 }
 
+// Heuristique conservatrice pour l'INBOX : on ne veut PAS proposer de désinscrire
+// d'emails humains (founders@startup.com, mary@brand.com, etc.).
+// Pour le dossier JUNK, on bypass cette heuristique (cf. processMessageIntoGroups).
 function looksLikeNewsletterSender(senderEmail, senderName) {
   const e = (senderEmail || "").toLowerCase();
   const n = (senderName || "").toLowerCase();
@@ -386,6 +389,8 @@ let junkNextLink = null;
 let inboxNextLink = null;
 // Emails scannés sans header List-Unsubscribe (candidats pour body scan)
 let bodyScanCandidates = [];
+// Compteurs cumulés (incluent les pages "load more")
+let scannedCounts = { junk: 0, inbox: 0 };
 // Cache du dossier "Éléments supprimés" résolu une fois via Graph
 // (nom "magique" deleteditems → vrai ID + displayName localisé)
 let deletedItemsFolder = null;
@@ -416,7 +421,8 @@ function groupingKey(senderEmail) {
 
 function findOrCreateGroup(senderEmail, info, sender) {
   const key = groupingKey(senderEmail);
-  let g = groups.find(g => g.key === key);
+  // Filter null entries (groupes supprimés laissés en place pour préserver les data-idx)
+  let g = groups.find(g => g && g.key === key);
   if (!g) {
     g = { key, sender, senderEmail, info, folders: new Set(), emails: [] };
     groups.push(g);
@@ -444,7 +450,8 @@ async function fetchAndProcess(url, folder, token) {
   if (!data) return null;
 
   const messages = data.value || [];
-  dbg(`${folder}: ${messages.length} messages`, "ok");
+  scannedCounts[folder] = (scannedCounts[folder] || 0) + messages.length;
+  dbg(`${folder}: ${messages.length} messages (cumul: ${scannedCounts[folder]})`, "ok");
 
   // Chemin rapide : process inline les messages qui ont déjà leurs headers
   const needsFallback = [];
@@ -459,7 +466,6 @@ async function fetchAndProcess(url, folder, token) {
     await fetchHeadersWithBatch(needsFallback, folder, token);
   }
 
-  setStatus(`✅ ${folder} : ${messages.length} emails — ${groups.length} expéditeur(s) au total`);
   return data["@odata.nextLink"] || null;
 }
 
@@ -468,8 +474,10 @@ function processMessageIntoGroups(d, folder) {
   const senderEmail = d.from?.emailAddress?.address || "";
   const sender      = d.from?.emailAddress?.name || senderEmail || "Inconnu";
   if (!info.method) {
-    // Pas de header → candidat pour body scan (si ça ressemble à une newsletter)
-    if (senderEmail && looksLikeNewsletterSender(senderEmail, sender)) {
+    // Pas de header → candidat pour body scan.
+    // Junk : Outlook a déjà flaggé l'email → on body-scan systématiquement (zéro filtre).
+    // Inbox : heuristique stricte pour préserver les humains (founders@..., mary@..., etc.).
+    if (senderEmail && (folder === "junk" || looksLikeNewsletterSender(senderEmail, sender))) {
       bodyScanCandidates.push({ id: d.id, folder, senderEmail, sender, subject: d.subject });
     }
     return;
@@ -480,16 +488,29 @@ function processMessageIntoGroups(d, folder) {
   g.emails.push({ id: d.id, subject: d.subject || "(sans objet)", folder });
 }
 
-// Scan le body des candidats (emails sans header, from "newsletter-like").
-// $batch de 20, 3 vagues concurrentes. Plafonné à 100 pour maîtriser la perf.
+// Scan le body des candidats (emails sans header).
+// Dédoublonnage par sender : 1 seul body-scan par expéditeur, mais tous les emails
+// "frères" (mêmes sender, non scannés) sont ajoutés au groupe quand le lien est trouvé
+// → l'utilisateur peut quand même les supprimer en bloc.
+// $batch de 20, 3 vagues concurrentes. Plafond 500 expéditeurs uniques.
 async function scanBodiesForUnsubLinks(candidates, token) {
   if (!candidates || candidates.length === 0) return;
-  const MAX = 100;
-  const slice = candidates.slice(0, MAX);
-  if (candidates.length > MAX) {
-    dbg(`Body scan : ${slice.length}/${candidates.length} (plafond ${MAX})`, "warn");
+
+  // Dédoublonnage : même groupingKey → 1 rep + N "siblings"
+  const byKey = new Map();
+  for (const c of candidates) {
+    const k = groupingKey(c.senderEmail);
+    if (!byKey.has(k)) byKey.set(k, { rep: c, siblings: [] });
+    else byKey.get(k).siblings.push(c);
+  }
+  const entries = [...byKey.values()];
+
+  const MAX = 500;
+  const slice = entries.slice(0, MAX);
+  if (entries.length > MAX) {
+    dbg(`Body scan : ${slice.length}/${entries.length} expéditeurs uniques (${candidates.length} emails au total, plafond ${MAX})`, "warn");
   } else {
-    dbg(`Body scan : ${slice.length} candidat(s) sans header`);
+    dbg(`Body scan : ${slice.length} expéditeur(s) unique(s) — ${candidates.length} email(s) couverts (dédoublonné)`);
   }
 
   const BATCH = 20, CONCURRENCY = 3;
@@ -500,17 +521,17 @@ async function scanBodiesForUnsubLinks(candidates, token) {
   for (let i = 0; i < batches.length; i += CONCURRENCY) {
     const wave = batches.slice(i, i + CONCURRENCY);
     await Promise.all(wave.map(async chunk => {
-      const requests = chunk.map((c, idx) => ({
+      const requests = chunk.map((entry, idx) => ({
         id: String(idx),
         method: "GET",
-        url: `/me/messages/${c.id}?$select=id,body`
+        url: `/me/messages/${entry.rep.id}?$select=id,body`
       }));
       try {
         const resp = await callGraph("https://graph.microsoft.com/v1.0/$batch", "POST", { requests }, token);
         for (const r of (resp.responses || [])) {
           if (r.status !== 200 || !r.body) continue;
-          const cand = chunk[parseInt(r.id)];
-          if (!cand) continue;
+          const entry = chunk[parseInt(r.id)];
+          if (!entry) continue;
           const url = extractBodyUnsubLink(r.body.body);
           if (!url) continue;
           const info = {
@@ -519,15 +540,21 @@ async function scanBodiesForUnsubLinks(candidates, token) {
           };
           try { info.displayLabel = new URL(url).hostname; }
           catch { info.displayLabel = url.substring(0, 40); }
-          const g = findOrCreateGroup(cand.senderEmail, info, cand.sender);
-          g.folders.add(cand.folder);
-          g.emails.push({ id: cand.id, subject: cand.subject || "(sans objet)", folder: cand.folder });
+
+          // Le rep + tous les siblings (non scannés) atterrissent dans le même groupe
+          const g = findOrCreateGroup(entry.rep.senderEmail, info, entry.rep.sender);
+          g.folders.add(entry.rep.folder);
+          g.emails.push({ id: entry.rep.id, subject: entry.rep.subject || "(sans objet)", folder: entry.rep.folder });
+          for (const sib of entry.siblings) {
+            g.folders.add(sib.folder);
+            g.emails.push({ id: sib.id, subject: sib.subject || "(sans objet)", folder: sib.folder });
+          }
           found++;
         }
       } catch (err) { dbg(`Body batch: ${err.message}`, "warn"); }
     }));
   }
-  dbg(`Body scan : ${found} lien(s) trouvé(s) dans le corps`, found > 0 ? "ok" : "info");
+  dbg(`Body scan : ${found} expéditeur(s) trouvé(s) via corps`, found > 0 ? "ok" : "info");
 }
 
 // Fallback $batch. On parallélise jusqu'à 3 batches simultanés pour rester sous
@@ -572,18 +599,24 @@ document.getElementById("btn-scan").addEventListener("click", async () => {
   junkNextLink = null;
   inboxNextLink = null;
   bodyScanCandidates = [];
+  scannedCounts = { junk: 0, inbox: 0 };
 
   try {
     const token = await getToken();
     if (!token) { setStatus("⏳ Redirection d'authentification..."); btn.disabled = false; return; }
 
-    setStatus("Scan en cours...");
     // $select=internetMessageHeaders évite un second passage $batch — un seul appel suffit.
     const SELECT = "id,subject,from,internetMessageHeaders";
     const scope = document.querySelector('input[name="scope"]:checked')?.value || "both";
     const scanJunk  = scope === "both" || scope === "junk";
     const scanInbox = scope === "both" || scope === "inbox";
     dbg(`Scan scope: ${scope}`);
+
+    const scopeLabel = scope === "both" ? "Inbox + Indésirables"
+                     : scope === "junk" ? "Indésirables"
+                     : "Inbox";
+    setStatus(`🔎 Scan en cours (${scopeLabel})...`);
+
     const [junkNext, inboxNext] = await Promise.all([
       scanJunk ? fetchAndProcess(
         `https://graph.microsoft.com/v1.0/me/mailFolders/junkemail/messages?$top=${PAGE_SIZE}&$select=${SELECT}`,
@@ -599,14 +632,15 @@ document.getElementById("btn-scan").addEventListener("click", async () => {
 
     // Body scan : récupère le corps des emails sans header qui ressemblent à des newsletters
     if (bodyScanCandidates.length > 0) {
-      setStatus(`🔎 Analyse du corps de ${Math.min(bodyScanCandidates.length, 100)} email(s)...`);
+      setStatus(`🔎 Analyse du corps de ${Math.min(bodyScanCandidates.length, 500)} email(s)...`);
       await scanBodiesForUnsubLinks(bodyScanCandidates, token);
       bodyScanCandidates = [];
     }
 
-    if (groups.length === 0) {
-      const total = groups.reduce((n, g) => n + g.emails.length, 0);
-      setStatus(`✅ Aucune newsletter trouvée dans les ${PAGE_SIZE * 2} derniers emails.`);
+    const active = groups.filter(Boolean);
+    const totalScanned = scannedCounts.junk + scannedCounts.inbox;
+    if (active.length === 0) {
+      setStatus(`✅ Aucune newsletter trouvée dans les ${totalScanned} derniers emails.`);
       btn.disabled = false;
       return;
     }
@@ -640,7 +674,7 @@ document.getElementById("btn-load-more").addEventListener("click", async () => {
     ]);
     // Body scan pour la nouvelle page aussi
     if (bodyScanCandidates.length > 0) {
-      setStatus(`🔎 Analyse du corps de ${Math.min(bodyScanCandidates.length, 100)} email(s)...`);
+      setStatus(`🔎 Analyse du corps de ${Math.min(bodyScanCandidates.length, 500)} email(s)...`);
       await scanBodiesForUnsubLinks(bodyScanCandidates, token);
       bodyScanCandidates = [];
     }
@@ -667,11 +701,13 @@ function renderResults() {
   const container = document.getElementById("results");
   container.innerHTML = "";
 
-  const totalEmails = groups.reduce((n, g) => n + g.emails.length, 0);
+  const active = groups.filter(Boolean);
+  const totalEmails = active.reduce((n, g) => n + g.emails.length, 0);
   document.getElementById("summary-label").innerHTML =
-    `<span class="count-badge">${groups.length}</span> expéditeur(s) · ${totalEmails} email(s)`;
+    `<span class="count-badge">${active.length}</span> expéditeur(s) · ${totalEmails} email(s)`;
 
   groups.forEach((group, idx) => {
+    if (!group) return; // skip slots vidés par delete
     const folderLabel = (group.folders.has("junk") && group.folders.has("inbox"))
       ? `<span class="folder-badge both">Junk+Inbox</span>`
       : group.folders.has("junk")
@@ -941,13 +977,15 @@ async function deleteGroup(idx, cardEl, deleteBtn) {
       groups[idx] = null;
       cardEl.remove();
       updateSummary();
-      const vm = confirmed === ok
-        ? `✅ ${ok} email(s) de ${group.sender} → "${trash.displayName}" (Graph confirme). Non visibles dans Outlook ? Ctrl+F5 ou clique ⟳ refresh (le client peut traîner 1 min). Debug → sonde serveur.`
+      const allDone = groups.filter(Boolean).length === 0;
+      const baseMsg = confirmed === ok
+        ? `✅ ${ok} email(s) de ${group.sender} → "${trash.displayName}" (Graph confirme). Non visibles dans Outlook ? Ctrl+F5 ou clique ⟳ refresh (le client peut traîner 1 min).`
         : `✅ ${ok} email(s) déplacés (${confirmed}/${ok} confirmés dans "${trash.displayName}"). Vérifie le debug pour les autres.`;
-      setStatus(vm);
-      if (groups.filter(Boolean).length === 0) {
+      if (allDone) {
         document.getElementById("results-container").classList.add("hidden");
-        setStatus("✅ Tout traité ! Rescannez pour vérifier.");
+        setStatus(`${baseMsg} Tout traité ! Rescannez pour vérifier.`);
+      } else {
+        setStatus(baseMsg);
       }
     } else {
       deleteBtn.disabled = false;
