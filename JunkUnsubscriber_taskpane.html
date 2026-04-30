@@ -209,16 +209,34 @@ async function getToken() {
     await initMsal();
     if (!msalReady) throw new Error("MSAL non initialisé");
   }
+
+  // Boîte Outlook actuellement ouverte (Mantu, Rise, etc.) — sert à choisir le bon compte MSAL
+  // quand plusieurs comptes sont en cache (cas du jonglage entre tenants).
+  const currentMailbox = (Office.context?.mailbox?.userProfile?.emailAddress || "").toLowerCase();
+  dbg(`Boîte Outlook courante: ${currentMailbox || "(inconnue)"}`);
+
   const accounts = msalInstance.getAllAccounts();
-  if (accounts.length > 0) {
+  const matching = currentMailbox
+    ? accounts.find(a => a.username?.toLowerCase() === currentMailbox)
+    : accounts[0];
+
+  if (matching) {
     try {
-      const r = await msalInstance.acquireTokenSilent({ scopes: GRAPH_SCOPES, account: accounts[0] });
-      dbg("Token silent OK", "ok");
+      const r = await msalInstance.acquireTokenSilent({ scopes: GRAPH_SCOPES, account: matching });
+      dbg(`Token silent OK — ${r.account.username}`, "ok");
       return r.accessToken;
     } catch (e) { dbg(`Silent échoué: ${e.message}`, "warn"); }
+  } else if (accounts.length > 0 && currentMailbox) {
+    dbg(`Comptes en cache (${accounts.map(a => a.username).join(", ")}) ne matchent pas ${currentMailbox} — popup forcée`, "warn");
   }
+
   try {
-    const r = await msalInstance.acquireTokenPopup({ scopes: GRAPH_SCOPES });
+    const popupRequest = { scopes: GRAPH_SCOPES };
+    if (currentMailbox) {
+      popupRequest.loginHint = currentMailbox;       // pré-remplit l'email
+      popupRequest.prompt    = "select_account";     // empêche un SSO silencieux sur le mauvais compte
+    }
+    const r = await msalInstance.acquireTokenPopup(popupRequest);
     dbg(`Token popup OK — ${r.account.username}`, "ok");
     return r.accessToken;
   } catch (popupErr) {
@@ -231,7 +249,12 @@ async function getToken() {
                     popupErr.errorCode === "monitor_window_timeout";
     if (blocked) {
       dbg("Popup bloqué — fallback redirect...", "warn");
-      await msalInstance.acquireTokenRedirect({ scopes: GRAPH_SCOPES });
+      const redirectRequest = { scopes: GRAPH_SCOPES };
+      if (currentMailbox) {
+        redirectRequest.loginHint = currentMailbox;
+        redirectRequest.prompt    = "select_account";
+      }
+      await msalInstance.acquireTokenRedirect(redirectRequest);
       return null;
     }
     throw popupErr;
