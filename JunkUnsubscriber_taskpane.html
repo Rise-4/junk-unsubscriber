@@ -8,6 +8,17 @@
   <script src="https://rise-4.github.io/junk-unsubscriber/msal-browser.min.js"></script>
   <!-- Office.js -->
   <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+  <!-- PostHog product analytics : tracking d'usage léger (compteurs, durées, méthodes — aucun contenu) -->
+  <script>
+    !function(t,e){var o,n,p,r;e.__SV||(window.posthog=e,e._i=[],e.init=function(i,s,a){function g(t,e){var o=e.split(".");2==o.length&&(t=t[o[0]],e=o[1]),t[e]=function(){t.push([e].concat(Array.prototype.slice.call(arguments,0)))}}(p=t.createElement("script")).type="text/javascript",p.crossOrigin="anonymous",p.async=!0,p.src=s.api_host.replace(".i.posthog.com","-assets.i.posthog.com")+"/static/array.js",(r=t.getElementsByTagName("script")[0]).parentNode.insertBefore(p,r);var u=e;for(void 0!==a?u=e[a]=[]:a="posthog",u.people=u.people||[],u.toString=function(t){var e="posthog";return"posthog"!==a&&(e+="."+a),t||(e+=" (stub)"),e},u.people.toString=function(){return u.toString(1)+".people (stub)"},o="capture identify alias people.set people.set_once set_config register register_once unregister opt_out_capturing has_opted_out_capturing opt_in_capturing reset isFeatureEnabled onFeatureFlags getFeatureFlag getFeatureFlagPayload reloadFeatureFlags group updateEarlyAccessFeatureEnrollment getEarlyAccessFeatures on onSessionId getSurveys getActiveMatchingSurveys renderSurvey canRenderSurvey getNextSurveyStep identifyDevice debug getPageViewId captureTraceFeedback captureTraceMetric".split(" "),n=0;n<o.length;n++)g(u,o[n]);e._i.push([i,s,a])},e.__SV=1)}(document,window.posthog||[]);
+    posthog.init('phc_vGneGjibxfL4hVPWXXPnNN8dBM8GMa6Nnn9ddUzUmJ4W', {
+      api_host: 'https://eu.i.posthog.com',
+      autocapture: false,
+      capture_pageview: false,
+      capture_pageleave: false,
+      disable_session_recording: true
+    });
+  </script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: 'Segoe UI', sans-serif; font-size: 13px; color: #201f1e; background: #faf9f8; }
@@ -167,6 +178,34 @@ function renderDebug() {
   p.scrollTop = p.scrollHeight;
 }
 function toggleDebug() { document.getElementById("debug-panel").classList.toggle("visible"); }
+
+// ============================================================
+// TELEMETRY (PostHog)
+// ============================================================
+// Capture événements d'usage anonymisés : compteurs, durées, méthodes.
+// Aucun contenu d'email, expéditeur ou URL n'est envoyé. Identifiant = email Office,
+// tenant dérivé du domaine pour breakdown Rise / Mantu / DXC dans les dashboards.
+const APP_VERSION = "1.0.0.9";
+
+function track(event, props) {
+  try {
+    if (typeof posthog !== "undefined" && posthog.capture) {
+      posthog.capture(event, props || {});
+    }
+  } catch (e) { /* ne jamais casser l'addin pour de la télémétrie */ }
+}
+
+function identifyUser() {
+  try {
+    const email = Office?.context?.mailbox?.userProfile?.emailAddress;
+    if (!email || typeof posthog === "undefined") return;
+    const lower  = email.toLowerCase();
+    const tenant = (lower.split("@")[1] || "unknown");
+    posthog.identify(lower, { tenant });
+    posthog.register({ app: "junk-unsubscriber", tenant, app_version: APP_VERSION });
+    dbg(`PostHog identify: tenant=${tenant}`, "ok");
+  } catch (e) { dbg(`PostHog identify failed: ${e.message}`, "warn"); }
+}
 
 // ============================================================
 // CONFIG
@@ -636,9 +675,11 @@ async function scanBodiesForUnsubLinks(candidates, token) {
 //  - Phase 2 : moves vers corbeille via $batch (20 par lot, 3 lots concurrents)
 //    → ~60 emails déplacés par seconde au lieu de 5/s en séquentiel.
 async function runAutoMode(token) {
+  const autoStartTs = Date.now();
   const targets = groups.filter(g => g && g.folders.has("junk"));
   if (targets.length === 0) {
     setStatus(`✅ Aucun expéditeur indésirable à traiter automatiquement.`);
+    track("auto_mode_run", { targets: 0, unsub_ok: 0, emails_targeted: 0, emails_deleted: 0, duration_ms: Date.now() - autoStartTs });
     return;
   }
 
@@ -738,6 +779,15 @@ async function runAutoMode(token) {
   if (failedDelete > 0) msg += ` · ${failedDelete} suppression(s) en échec`;
   setStatus(msg);
   dbg(`Auto terminé : ${unsubOk}/${targets.length} unsub, ${deletedIds.size}/${junkEmails.length} delete`, "ok");
+  track("auto_mode_run", {
+    targets: targets.length,
+    unsub_ok: unsubOk,
+    unsub_failed: failedUnsub,
+    emails_targeted: junkEmails.length,
+    emails_deleted: deletedIds.size,
+    delete_failed: failedDelete,
+    duration_ms: Date.now() - autoStartTs
+  });
 }
 
 // ============================================================
@@ -762,7 +812,10 @@ document.getElementById("btn-scan").addEventListener("click", async () => {
     const scope = document.querySelector('input[name="scope"]:checked')?.value || "both";
     const scanJunk  = scope === "both" || scope === "junk";
     const scanInbox = scope === "both" || scope === "inbox";
+    const autoOn   = document.getElementById("auto-mode-cb").checked;
+    const scanStartTs = Date.now();
     dbg(`Scan scope: ${scope}`);
+    track("scan_started", { scope, auto_mode: autoOn });
 
     const scopeLabel = scope === "both" ? "Inbox + Indésirables"
                      : scope === "junk" ? "Indésirables"
@@ -808,6 +861,34 @@ document.getElementById("btn-scan").addEventListener("click", async () => {
 
     const active = groups.filter(Boolean);
     const totalScanned = scannedCounts.junk + scannedCounts.inbox;
+
+    // Agrège les méthodes pour la télémétrie (compteurs uniquement, aucun contenu)
+    const methodCounts = { one_click: 0, mailto: 0, http_auto: 0, popup: 0 };
+    let headerGroups = 0, bodyGroups = 0;
+    for (const g of active) {
+      const m = g.info.method;
+      if (m === "one-click") methodCounts.one_click++;
+      else if (m === "graph-mailto") methodCounts.mailto++;
+      else if (m === "http-auto") methodCounts.http_auto++;
+      else if (m === "popup") methodCounts.popup++;
+      if (g.info.source === "body") bodyGroups++; else headerGroups++;
+    }
+    track("scan_completed", {
+      scope,
+      auto_mode: autoOn,
+      duration_ms: Date.now() - scanStartTs,
+      emails_scanned: totalScanned,
+      junk_scanned: scannedCounts.junk,
+      inbox_scanned: scannedCounts.inbox,
+      groups_found: active.length,
+      header_groups: headerGroups,
+      body_groups: bodyGroups,
+      methods_one_click: methodCounts.one_click,
+      methods_mailto: methodCounts.mailto,
+      methods_http_auto: methodCounts.http_auto,
+      methods_popup: methodCounts.popup
+    });
+
     if (active.length === 0) {
       setStatus(`✅ Aucune newsletter trouvée dans les ${totalScanned} derniers emails.`);
       btn.disabled = false;
@@ -816,7 +897,6 @@ document.getElementById("btn-scan").addEventListener("click", async () => {
 
     // === Mode auto : désinscription + suppression sans confirmation côté Junk ===
     // N'agit que si scope inclut Indésirables ET case cochée. Inbox jamais touchée.
-    const autoOn = document.getElementById("auto-mode-cb").checked;
     if (autoOn && scanJunk) {
       await runAutoMode(token);
     } else {
@@ -826,6 +906,7 @@ document.getElementById("btn-scan").addEventListener("click", async () => {
   } catch (err) {
     dbg(`ERREUR SCAN: ${err.message}`, "err");
     setStatus(`❌ Erreur : ${err.message}`);
+    track("error", { stage: "scan", message: (err.message || "").substring(0, 200) });
   } finally {
     btn.disabled = false;
   }
@@ -953,6 +1034,7 @@ async function executeUnsubscribe(idx, cardEl, unsubBtn, deleteBtn) {
       if (ok) {
         markCardSuccess(cardEl, unsubBtn, `✅ Désinscrit`);
         setStatus(`✅ ${group.sender} : désinscription one-click envoyée. Clique 🗑️ Supprimer pour jeter les ${group.emails.length} email(s).`);
+        track("unsub_executed", { method: "one-click", success: true, source: info.source, bulk: false });
         return;
       }
       dbg(`One-click POST échoué, fallback GET silencieux`, "warn");
@@ -970,6 +1052,7 @@ async function executeUnsubscribe(idx, cardEl, unsubBtn, deleteBtn) {
         );
         markCardSuccess(cardEl, unsubBtn, `✅ Désinscrit`);
         setStatus(`✅ ${group.sender} : mail de désinscription envoyé. Clique 🗑️ Supprimer pour jeter les ${group.emails.length} email(s).`);
+        track("unsub_executed", { method: "graph-mailto", success: true, source: info.source, bulk: false });
         return;
       } catch (err) {
         dbg(`Graph /unsubscribe ERREUR: ${err.message} — fallback GET silencieux`, "warn");
@@ -987,6 +1070,7 @@ async function executeUnsubscribe(idx, cardEl, unsubBtn, deleteBtn) {
         markCardSuccess(cardEl, unsubBtn, `✅ Désinscrit`);
         const src = info.source === "body" ? " (lien trouvé dans le corps)" : "";
         setStatus(`✅ ${group.sender}${src} : désinscription envoyée. Clique 🗑️ Supprimer pour jeter les ${group.emails.length} email(s).`);
+        track("unsub_executed", { method: "http-auto", success: true, source: info.source, bulk: false });
         return;
       }
       dbg(`GET silencieux échoué — fallback popup`, "warn");
@@ -998,6 +1082,7 @@ async function executeUnsubscribe(idx, cardEl, unsubBtn, deleteBtn) {
       setStatus(`❌ Aucune méthode de désinscription trouvée pour ${group.sender}.`);
       unsubBtn.disabled = false;
       unsubBtn.textContent = origLabel;
+      track("unsub_executed", { method: "none", success: false, source: info.source, bulk: false });
       return;
     }
     dbg(`Popup (dernier recours) → ${url}`);
@@ -1005,11 +1090,13 @@ async function executeUnsubscribe(idx, cardEl, unsubBtn, deleteBtn) {
     setStatus(`🔗 Page de désinscription ouverte pour ${group.sender}. Finalise dans l'onglet.`);
     unsubBtn.disabled = false;
     unsubBtn.textContent = "✓ Ouvert — supprimer ?";
+    track("unsub_executed", { method: "popup", success: true, source: info.source, bulk: false });
   } catch (err) {
     dbg(`ERREUR executeUnsubscribe: ${err.message}`, "err");
     setStatus(`❌ Erreur : ${err.message}`);
     unsubBtn.disabled = false;
     unsubBtn.textContent = origLabel;
+    track("error", { stage: "unsub", message: (err.message || "").substring(0, 200) });
   }
 }
 
@@ -1103,12 +1190,13 @@ function markCardSuccess(cardEl, unsubBtn, label) {
 // parentFolderId qu'on VÉRIFIE pour confirmer qu'il a bien atterri. Le client
 // Outlook peut prendre 5-60s pour synchroniser — la confirmation Graph est
 // immédiate et fiable (source de vérité côté Microsoft).
-async function deleteGroup(idx, cardEl, deleteBtn) {
+async function deleteGroup(idx, cardEl, deleteBtn, bulk = false) {
   const group = groups[idx];
   if (!group) return;
 
   deleteBtn.disabled = true;
   deleteBtn.textContent = "⏳…";
+  const initialCount = group.emails.length;
 
   try {
     const token = await getToken();
@@ -1182,11 +1270,13 @@ async function deleteGroup(idx, cardEl, deleteBtn) {
       deleteBtn.textContent = `🗑️ Supprimer (${group.emails.length})`;
       setStatus(`⚠️ ${ok} supprimés (${confirmed} confirmés), ${errors} erreur(s). Réessayez.`);
     }
+    track("delete_executed", { emails_count: initialCount, success_count: ok, confirmed_count: confirmed, errors, bulk });
   } catch (err) {
     dbg(`ERREUR SUPPRESSION: ${err.message}`, "err");
     setStatus(`❌ Erreur : ${err.message}`);
     deleteBtn.disabled = false;
     deleteBtn.textContent = `🗑️ Supprimer (${group.emails.length})`;
+    track("error", { stage: "delete", message: (err.message || "").substring(0, 200) });
   }
 }
 
@@ -1241,6 +1331,7 @@ document.getElementById("btn-unsub-bulk").addEventListener("click", async () => 
         const unsubBtn = card?.querySelector(".btn-sm.unsub");
         if (card && unsubBtn) markCardSuccess(card, unsubBtn, `✅ Désinscrit`);
       } else { errors++; }
+      track("unsub_executed", { method: "one-click", success: !!r, source: groups[i]?.info.source, bulk: true });
     }
   }
 
@@ -1257,6 +1348,7 @@ document.getElementById("btn-unsub-bulk").addEventListener("click", async () => 
         const unsubBtn = card?.querySelector(".btn-sm.unsub");
         if (card && unsubBtn) markCardSuccess(card, unsubBtn, `✅ Désinscrit`);
       } else { errors++; }
+      track("unsub_executed", { method: "http-auto", success: !!r, source: groups[i]?.info.source, bulk: true });
     }
   }
 
@@ -1267,16 +1359,18 @@ document.getElementById("btn-unsub-bulk").addEventListener("click", async () => 
       if (token) {
         for (const i of mailtoIdx) {
           btn.textContent = `⏳ mailto (${mailtoIdx.indexOf(i) + 1}/${mailtoIdx.length})…`;
+          let success = false;
           try {
             await callGraph(
               `https://graph.microsoft.com/beta/me/messages/${groups[i].emails[0].id}/unsubscribe`,
               "POST", null, token
             );
-            ok++;
+            ok++; success = true;
             const card = document.querySelector(`.group-item[data-idx="${i}"]`);
             const unsubBtn = card?.querySelector(".btn-sm.unsub");
             if (card && unsubBtn) markCardSuccess(card, unsubBtn, `✅ Désinscrit`);
           } catch (e) { errors++; dbg(`Graph /unsubscribe ${i}: ${e.message}`, "err"); }
+          track("unsub_executed", { method: "graph-mailto", success, source: groups[i]?.info.source, bulk: true });
         }
       }
     } catch (e) { dbg(`Bulk mailto token: ${e.message}`, "err"); }
@@ -1312,7 +1406,7 @@ document.getElementById("btn-delete-bulk").addEventListener("click", async () =>
     const card = document.querySelector(`.group-item[data-idx="${idx}"]`);
     const deleteBtn = card?.querySelector(".btn-sm.delete");
     if (!card || !deleteBtn) continue;
-    await deleteGroup(idx, card, deleteBtn);
+    await deleteGroup(idx, card, deleteBtn, true);
     done++;
     setStatus(`🗑️ Suppression... ${done}/${checkedIdx.length}`);
   }
@@ -1342,6 +1436,7 @@ Office.onReady((info) => {
   officeReady = true;
   dbg(`Office.onReady OK — host: ${info.host}, platform: ${info.platform}`, "ok");
   document.getElementById("btn-scan").disabled = false;
+  identifyUser();
 });
 setTimeout(() => {
   if (!officeReady) {
