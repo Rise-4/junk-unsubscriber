@@ -62,6 +62,13 @@
     .btn-load-more:hover:not(:disabled) { background: #edebe9; }
     .btn-load-more:disabled { opacity: 0.6; cursor: not-allowed; }
 
+    #auto-mode-bar { margin: 8px 10px 0; padding: 7px 9px; background: #fff8e1; border: 1px solid #fde7af; border-radius: 4px; font-size: 11px; color: #5d4307; transition: opacity 0.2s; }
+    #auto-mode-bar.disabled { opacity: 0.4; pointer-events: none; }
+    #auto-mode-bar label { display: flex; align-items: flex-start; gap: 7px; cursor: pointer; line-height: 1.4; }
+    #auto-mode-bar input[type=checkbox] { margin: 1px 0 0; cursor: pointer; flex-shrink: 0; }
+    #auto-mode-bar .am-title { font-weight: 600; color: #4a3506; }
+    #auto-mode-bar .am-hint  { color: #8a6914; }
+
     #scope-bar { display: flex; gap: 4px; margin: 10px 10px 0; padding: 3px; background: #f3f2f1; border-radius: 4px; }
     #scope-bar label { flex: 1; text-align: center; padding: 6px 4px; font-size: 11px; color: #605e5c; cursor: pointer; border-radius: 3px; transition: background 0.15s; user-select: none; }
     #scope-bar input[type=radio] { display: none; }
@@ -95,6 +102,13 @@
   <label><input type="radio" name="scope" value="both" checked/><span>Les deux</span></label>
   <label><input type="radio" name="scope" value="inbox"/><span>Boîte de réception</span></label>
   <label><input type="radio" name="scope" value="junk"/><span>Indésirables</span></label>
+</div>
+
+<div id="auto-mode-bar" title="N'agit QUE sur le dossier Indésirables. Les emails de la Boîte de réception ne sont jamais touchés.">
+  <label>
+    <input type="checkbox" id="auto-mode-cb"/>
+    <span><span class="am-title">⚡ Mode auto (Indésirables)</span> <span class="am-hint">— désinscrit & supprime tout sans confirmation</span></span>
+  </label>
 </div>
 
 <button class="btn-primary" id="btn-scan">🔍 Scanner</button>
@@ -166,6 +180,15 @@ const REDIRECT_URI = "https://rise-4.github.io/junk-unsubscriber/auth-redirect.h
 // Mail.Send requis pour l'action Graph /unsubscribe (cas mailto:) — RFC 8058
 const GRAPH_SCOPES = ["Mail.ReadWrite", "Mail.Send"];
 const PAGE_SIZE   = 200; // emails par dossier par page (Graph max = 1000, on reste raisonnable)
+
+// Opti A : ne demander QUE les 2 headers utiles via propriétés étendues MAPI
+// (au lieu de tout internetMessageHeaders qui pèse ~30-100 KB par mail à cause de DKIM/Received).
+// PSETID_InternetHeaders : namespace standard où Exchange stocke chaque header internet
+// indexé par son nom (lowercase). Payload divisé par ~10-20× sur le scan.
+const HEADER_NS  = "{00020386-0000-0000-C000-000000000046}";
+const LU_FILTER  = `id eq 'String ${HEADER_NS} Name list-unsubscribe' or id eq 'String ${HEADER_NS} Name list-unsubscribe-post'`;
+const LU_EXPAND  = `singleValueExtendedProperties($filter=${encodeURIComponent(LU_FILTER)})`;
+const MSG_SELECT = "id,subject,from";
 
 dbg("Page chargée"); dbg(`Authority: ${AUTHORITY}`);
 
@@ -302,6 +325,21 @@ async function callGraph(url, method, body, token, retries = 3) {
 // ============================================================
 // HEADER PARSING (RFC 8058 aware)
 // ============================================================
+// Convertit la réponse Graph en tableau {name, value} unifié, peu importe la source :
+//  - via $expand=singleValueExtendedProperties (chemin rapide, Opti A — payload léger)
+//  - via $select=internetMessageHeaders (legacy, gardé en filet de sécurité)
+function extractHeadersFromMessage(msg) {
+  if (msg.singleValueExtendedProperties && Array.isArray(msg.singleValueExtendedProperties)) {
+    return msg.singleValueExtendedProperties.map(p => {
+      // id format : "String {GUID} Name <header-name>"
+      const m = p.id?.match(/Name\s+(.+)$/);
+      return { name: m ? m[1] : "", value: p.value || "" };
+    });
+  }
+  return msg.internetMessageHeaders || [];
+}
+
+
 // Retourne { oneClickUrl, mailtoUrl, httpsUrl, displayLabel, method }
 // - oneClickUrl  : URL à POSTer en RFC 8058 one-click (header + List-Unsubscribe-Post)
 // - mailtoUrl    : mailto: trouvé dans le header (utilisable via Graph /unsubscribe)
@@ -461,10 +499,9 @@ function findOrCreateGroup(senderEmail, info, sender) {
 // ============================================================
 // FETCH + PROCESS A PAGE
 // ============================================================
-// Chemin rapide : on demande internetMessageHeaders directement dans le list call
-// ($select=internetMessageHeaders). Un seul appel Graph pour ~200 emails.
-// Fallback : si Graph omet les headers pour certains messages (limite serveur
-// historique), on rattrape avec un $batch (20 req/call, parallèle).
+// Un seul appel Graph par dossier pour ~200 emails. Avec l'Opti A on ne récupère
+// QUE les 2 headers utiles via propriétés étendues — pas besoin de fallback $batch
+// (les ext-props ne sont pas omises silencieusement comme l'était internetMessageHeaders).
 async function fetchAndProcess(url, folder, token) {
   const data = await callGraph(url, "GET", null, token).catch(err => {
     dbg(`Erreur scan ${folder}: ${err.message}`, "warn");
@@ -476,24 +513,15 @@ async function fetchAndProcess(url, folder, token) {
   scannedCounts[folder] = (scannedCounts[folder] || 0) + messages.length;
   dbg(`${folder}: ${messages.length} messages (cumul: ${scannedCounts[folder]})`, "ok");
 
-  // Chemin rapide : process inline les messages qui ont déjà leurs headers
-  const needsFallback = [];
   for (const d of messages) {
-    if (!d.internetMessageHeaders) { needsFallback.push(d); continue; }
     processMessageIntoGroups(d, folder);
-  }
-
-  // Fallback : fetch individuel pour ceux sans headers. $batch parallèle (3 concurrents).
-  if (needsFallback.length > 0) {
-    dbg(`${folder}: fallback $batch pour ${needsFallback.length} message(s)`, "warn");
-    await fetchHeadersWithBatch(needsFallback, folder, token);
   }
 
   return data["@odata.nextLink"] || null;
 }
 
 function processMessageIntoGroups(d, folder) {
-  const info = extractUnsubscribeInfo(d.internetMessageHeaders || []);
+  const info = extractUnsubscribeInfo(extractHeadersFromMessage(d));
   const senderEmail = d.from?.emailAddress?.address || "";
   const sender      = d.from?.emailAddress?.name || senderEmail || "Inconnu";
   if (!info.method) {
@@ -580,33 +608,136 @@ async function scanBodiesForUnsubLinks(candidates, token) {
   dbg(`Body scan : ${found} expéditeur(s) trouvé(s) via corps`, found > 0 ? "ok" : "info");
 }
 
-// Fallback $batch. On parallélise jusqu'à 3 batches simultanés pour rester sous
-// le seuil de throttling de Graph (429 au-delà typiquement).
-async function fetchHeadersWithBatch(messages, folder, token) {
-  const BATCH = 20;
-  const CONCURRENCY = 3;
-  const allBatches = [];
-  for (let i = 0; i < messages.length; i += BATCH) {
-    allBatches.push(messages.slice(i, i + BATCH));
+// ============================================================
+// AUTO MODE (Indésirables uniquement)
+// ============================================================
+// État du toggle persisté en localStorage. Désactivé visuellement quand le scope
+// est "Inbox" (pas de Junk → rien à automatiser).
+(function initAutoMode() {
+  const cb = document.getElementById("auto-mode-cb");
+  cb.checked = localStorage.getItem("auto-mode") === "1";
+  cb.addEventListener("change", () => localStorage.setItem("auto-mode", cb.checked ? "1" : "0"));
+
+  function refreshAutoBar() {
+    const scope = document.querySelector('input[name="scope"]:checked')?.value || "both";
+    document.getElementById("auto-mode-bar").classList.toggle("disabled", scope === "inbox");
   }
+  document.querySelectorAll('input[name="scope"]').forEach(r => r.addEventListener("change", refreshAutoBar));
+  refreshAutoBar();
+})();
+
+// Désinscrit + supprime tous les expéditeurs trouvés dans Junk, sans interaction.
+// Quand scope === "both", on ne touche QUE les emails du dossier Junk : si un même
+// expéditeur a aussi des emails dans Inbox, ils restent intacts (group survives).
+//
+// Stratégie perf :
+//  - Phase 1 : unsubs en parallèle (no-cors fire-and-forget pour one-click/http,
+//    Graph /unsubscribe pour mailto — callGraph gère le throttling 429 tout seul).
+//  - Phase 2 : moves vers corbeille via $batch (20 par lot, 3 lots concurrents)
+//    → ~60 emails déplacés par seconde au lieu de 5/s en séquentiel.
+async function runAutoMode(token) {
+  const targets = groups.filter(g => g && g.folders.has("junk"));
+  if (targets.length === 0) {
+    setStatus(`✅ Aucun expéditeur indésirable à traiter automatiquement.`);
+    return;
+  }
+
+  setStatus(`⚡ Mode auto : désinscription de ${targets.length} expéditeur(s)...`);
+  dbg(`Auto mode : ${targets.length} groupes ciblés`);
+
+  // === Phase 1 : désinscriptions en parallèle ===
+  const unsubResults = await Promise.all(targets.map(async g => {
+    try {
+      if (g.info.method === "one-click" && g.info.oneClickUrl) {
+        return await postOneClickUnsubscribe(g.info.oneClickUrl);
+      }
+      if (g.info.method === "graph-mailto" && g.emails[0]?.id) {
+        await callGraph(
+          `https://graph.microsoft.com/beta/me/messages/${g.emails[0].id}/unsubscribe`,
+          "POST", null, token
+        );
+        return true;
+      }
+      if (g.info.method === "http-auto" && g.info.httpsUrl) {
+        return await silentGetUnsubscribe(g.info.httpsUrl);
+      }
+      // method "popup" : on skip l'unsub (pas automatisable) mais on supprime quand même
+      // — pour le boss, Junk = poubelle ; le mail ré-arrivera et sera retraité au prochain scan.
+      return false;
+    } catch (e) {
+      dbg(`Auto unsub ${g.sender}: ${e.message}`, "warn");
+      return false;
+    }
+  }));
+  const unsubOk = unsubResults.filter(Boolean).length;
+
+  // === Phase 2 : suppression des emails Junk via $batch ===
+  const trash = await getDeletedItemsFolder(token);
+  const junkEmails = [];
+  for (const g of targets) {
+    for (const e of g.emails) if (e.folder === "junk") junkEmails.push({ groupRef: g, email: e });
+  }
+
+  setStatus(`⚡ Auto : ${unsubOk}/${targets.length} désinscrits · suppression de ${junkEmails.length} email(s)...`);
+
+  const BATCH = 20, CONCURRENCY = 3;
+  const deletedIds = new Set();
+  const allBatches = [];
+  for (let i = 0; i < junkEmails.length; i += BATCH) allBatches.push(junkEmails.slice(i, i + BATCH));
 
   for (let i = 0; i < allBatches.length; i += CONCURRENCY) {
     const wave = allBatches.slice(i, i + CONCURRENCY);
-    await Promise.all(wave.map(async slice => {
-      const requests = slice.map((msg, idx) => ({
+    await Promise.all(wave.map(async chunk => {
+      const requests = chunk.map((entry, idx) => ({
         id: String(idx),
-        method: "GET",
-        url: `/me/messages/${msg.id}?$select=id,subject,from,internetMessageHeaders`
+        method: "POST",
+        url: `/me/messages/${entry.email.id}/move`,
+        body: { destinationId: trash.id },
+        headers: { "Content-Type": "application/json" }
       }));
       try {
         const resp = await callGraph("https://graph.microsoft.com/v1.0/$batch", "POST", { requests }, token);
         for (const r of (resp.responses || [])) {
-          if (r.status !== 200 || !r.body) continue;
-          processMessageIntoGroups(r.body, folder);
+          // 201 Created (move) = succès. 200 sur certains tenants. On vérifie parentFolderId
+          // si le body est présent pour confirmation forte.
+          if ((r.status === 201 || r.status === 200) && r.body) {
+            const entry = chunk[parseInt(r.id)];
+            if (entry && (!r.body.parentFolderId || r.body.parentFolderId === trash.id)) {
+              deletedIds.add(entry.email.id);
+            }
+          }
         }
-      } catch (err) { dbg(`Batch fallback: ${err.message}`, "warn"); }
+      } catch (e) { dbg(`Auto batch delete: ${e.message}`, "warn"); }
     }));
   }
+
+  // === Phase 3 : update state & re-render ===
+  // Groupe entièrement vidé (folders={junk}) → on retire du tableau.
+  // Groupe mixte (folders={junk,inbox}) → on retire les emails Junk supprimés, on garde le reste.
+  for (const g of targets) {
+    const surviving = g.emails.filter(e => !deletedIds.has(e.id));
+    if (surviving.length === 0) {
+      const idx = groups.indexOf(g);
+      if (idx !== -1) groups[idx] = null;
+    } else {
+      g.emails = surviving;
+      g.folders = new Set(surviving.map(e => e.folder));
+      g.unsubDone = true;
+      g.unsubDoneLabel = "⚡ Auto traité";
+    }
+  }
+  renderResults();
+  if (groups.filter(Boolean).length === 0) {
+    document.getElementById("results-container").classList.add("hidden");
+  }
+
+  const failedUnsub = targets.length - unsubOk;
+  const failedDelete = junkEmails.length - deletedIds.size;
+  let msg = `⚡ Auto terminé : ${unsubOk}/${targets.length} désinscrits, ${deletedIds.size}/${junkEmails.length} email(s) → "${trash.displayName}"`;
+  if (failedUnsub > 0) msg += ` · ${failedUnsub} unsub non auto (popup)`;
+  if (failedDelete > 0) msg += ` · ${failedDelete} suppression(s) en échec`;
+  setStatus(msg);
+  dbg(`Auto terminé : ${unsubOk}/${targets.length} unsub, ${deletedIds.size}/${junkEmails.length} delete`, "ok");
 }
 
 // ============================================================
@@ -628,8 +759,6 @@ document.getElementById("btn-scan").addEventListener("click", async () => {
     const token = await getToken();
     if (!token) { setStatus("⏳ Redirection d'authentification..."); btn.disabled = false; return; }
 
-    // $select=internetMessageHeaders évite un second passage $batch — un seul appel suffit.
-    const SELECT = "id,subject,from,internetMessageHeaders";
     const scope = document.querySelector('input[name="scope"]:checked')?.value || "both";
     const scanJunk  = scope === "both" || scope === "junk";
     const scanInbox = scope === "both" || scope === "inbox";
@@ -642,22 +771,39 @@ document.getElementById("btn-scan").addEventListener("click", async () => {
 
     const [junkNext, inboxNext] = await Promise.all([
       scanJunk ? fetchAndProcess(
-        `https://graph.microsoft.com/v1.0/me/mailFolders/junkemail/messages?$top=${PAGE_SIZE}&$select=${SELECT}`,
+        `https://graph.microsoft.com/v1.0/me/mailFolders/junkemail/messages?$top=${PAGE_SIZE}&$select=${MSG_SELECT}&$expand=${LU_EXPAND}`,
         "junk", token
       ) : Promise.resolve(null),
       scanInbox ? fetchAndProcess(
-        `https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?$top=${PAGE_SIZE}&$select=${SELECT}`,
+        `https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?$top=${PAGE_SIZE}&$select=${MSG_SELECT}&$expand=${LU_EXPAND}`,
         "inbox", token
       ) : Promise.resolve(null)
     ]);
     junkNextLink  = junkNext;
     inboxNextLink = inboxNext;
 
+    // === Opti C : rendu incrémental ===
+    // Affiche immédiatement les groupes trouvés via headers (~1-2s après le clic)
+    // pendant que le body-scan tourne en parallèle ensuite.
+    const headerOnlyCount = groups.filter(Boolean).length;
+    if (headerOnlyCount > 0) {
+      renderResults();
+      document.getElementById("results-container").classList.remove("hidden");
+      updateLoadMore();
+    }
+
     // Body scan : récupère le corps des emails sans header qui ressemblent à des newsletters
     if (bodyScanCandidates.length > 0) {
-      setStatus(`🔎 Analyse du corps de ${Math.min(bodyScanCandidates.length, 500)} email(s)...`);
+      const candCount = Math.min(bodyScanCandidates.length, 500);
+      setStatus(headerOnlyCount > 0
+        ? `✅ ${headerOnlyCount} expéditeur(s) trouvé(s) · 🔎 Analyse approfondie de ${candCount} email(s)...`
+        : `🔎 Analyse du corps de ${candCount} email(s)...`);
       await scanBodiesForUnsubLinks(bodyScanCandidates, token);
       bodyScanCandidates = [];
+      // Re-render pour intégrer les groupes trouvés via le corps
+      renderResults();
+      document.getElementById("results-container").classList.remove("hidden");
+      updateLoadMore();
     }
 
     const active = groups.filter(Boolean);
@@ -668,10 +814,14 @@ document.getElementById("btn-scan").addEventListener("click", async () => {
       return;
     }
 
-    setStatus("");
-    renderResults();
-    document.getElementById("results-container").classList.remove("hidden");
-    updateLoadMore();
+    // === Mode auto : désinscription + suppression sans confirmation côté Junk ===
+    // N'agit que si scope inclut Indésirables ET case cochée. Inbox jamais touchée.
+    const autoOn = document.getElementById("auto-mode-cb").checked;
+    if (autoOn && scanJunk) {
+      await runAutoMode(token);
+    } else {
+      setStatus("");
+    }
 
   } catch (err) {
     dbg(`ERREUR SCAN: ${err.message}`, "err");
@@ -695,14 +845,15 @@ document.getElementById("btn-load-more").addEventListener("click", async () => {
       junkNextLink  ? fetchAndProcess(junkNextLink,  "junk",  token).then(nl => junkNextLink  = nl) : null,
       inboxNextLink ? fetchAndProcess(inboxNextLink, "inbox", token).then(nl => inboxNextLink = nl) : null,
     ]);
-    // Body scan pour la nouvelle page aussi
+    // Affichage immédiat des nouveaux groupes header-based, puis enrichissement post body-scan
+    renderResults();
+    updateLoadMore();
     if (bodyScanCandidates.length > 0) {
       setStatus(`🔎 Analyse du corps de ${Math.min(bodyScanCandidates.length, 500)} email(s)...`);
       await scanBodiesForUnsubLinks(bodyScanCandidates, token);
       bodyScanCandidates = [];
+      renderResults();
     }
-    renderResults();
-    updateLoadMore();
     setStatus("");
   } catch (err) {
     dbg(`ERREUR LOAD MORE: ${err.message}`, "err");
@@ -766,6 +917,12 @@ function renderResults() {
     deleteBtn.addEventListener("click", () => deleteGroup(idx, div, deleteBtn));
 
     container.appendChild(div);
+
+    // Restaure l'état vert/désactivé si l'utilisateur a déjà cliqué Se désinscrire
+    // sur ce groupe avant qu'un re-render (post body-scan) n'ait lieu.
+    if (group.unsubDone) {
+      applySuccessStyle(div, unsubBtn, group.unsubDoneLabel || "✅ Désinscrit");
+    }
   });
 
   document.getElementById("select-all").checked = true;
@@ -916,8 +1073,7 @@ function openUrlPopup(url) {
 
 // Feedback visuel quand la désinscription a réussi mais qu'il n'y a pas de page à ouvrir
 // (one-click POST ou Graph mailto). Carte verte + bouton "✅ Désinscrit" désactivé.
-// La carte reste visible, l'archivage reste à la main de l'utilisateur.
-function markCardSuccess(cardEl, unsubBtn, label) {
+function applySuccessStyle(cardEl, unsubBtn, label) {
   cardEl.style.transition = "background 0.3s, border-color 0.3s";
   cardEl.style.background = "#dff6dd";
   cardEl.style.borderColor = "#107c10";
@@ -926,6 +1082,17 @@ function markCardSuccess(cardEl, unsubBtn, label) {
   unsubBtn.style.borderColor = "#107c10";
   unsubBtn.style.background = "#f0fbef";
   unsubBtn.disabled = true;
+}
+
+// Persiste l'état "désinscrit" sur le groupe pour qu'un re-render incrémental
+// (après que le body-scan ait terminé) ne perde pas le visuel vert/désactivé.
+function markCardSuccess(cardEl, unsubBtn, label) {
+  const idx = parseInt(cardEl.dataset.idx);
+  if (!isNaN(idx) && groups[idx]) {
+    groups[idx].unsubDone = true;
+    groups[idx].unsubDoneLabel = label;
+  }
+  applySuccessStyle(cardEl, unsubBtn, label);
 }
 
 // ============================================================
