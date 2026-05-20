@@ -54,6 +54,12 @@
     .folder-badge.both  { background: #f3f2f1; color: #323130; }
     .count-badge { background: #0078d4; color: white; border-radius: 10px; padding: 1px 7px; font-size: 11px; margin-left: 4px; }
 
+    /* Indicateur visuel discret pour les expéditeurs sans méthode de désinscription :
+       carte légèrement grisée, URL line en italique gris. Aucune action distincte
+       — l'user clique Supprimer comme pour les autres. */
+    .group-item.no-method { background: #fafaf9; border-color: #e1dfdd; }
+    .group-item.no-method .group-url { color: #8a8886; font-style: italic; }
+
     .btn-sm { padding: 4px 10px; border-radius: 3px; font-size: 11px; cursor: pointer; font-weight: 600; white-space: nowrap; }
     .btn-sm:disabled { opacity: 0.5; cursor: not-allowed; }
     .btn-sm.unsub   { background: white; color: #0078d4; border: 1px solid #0078d4; }
@@ -469,7 +475,10 @@ function extractBulkSignals(headers) {
   }
 
   if (bcl !== null && bcl >= 1) return { isBulk: true, bcl, cat, reason: `BCL:${bcl}` };
-  if (cat === "BULK" || cat === "SPM" || cat === "HSPM") return { isBulk: true, bcl, cat, reason: `CAT:${cat}` };
+  // On garde uniquement CAT:BULK. CAT:SPM/HSPM = spam au sens "contenu suspect" qui inclut
+  // les cold pitches B2B (founders avec pitch deck, recruteurs) qu'on veut LAISSER visibles.
+  // Defender BCL/CAT:BULK couvrent bien les newsletters/notifs/auto/pub — c'est ça notre cible.
+  if (cat === "BULK") return { isBulk: true, bcl, cat, reason: `CAT:${cat}` };
 
   // --- Fallback : headers RFC standards (gateway tiers, Defender absent) ---
   if (byName("list-id"))         return { isBulk: true, bcl, cat, reason: "List-ID" };
@@ -646,14 +655,11 @@ function processMessageIntoGroups(d, folder) {
 
   if (!senderEmail) return;
 
-  // Cas 2 : Junk → Outlook a déjà flaggé, body-scan systématique (zéro filtre).
-  if (folder === "junk") {
-    bodyScanCandidates.push({ id: d.id, folder, senderEmail, sender, subject: d.subject });
-    return;
-  }
-
-  // Cas 3 : Inbox + un header RFC bulk indexé (List-ID, Feedback-ID, Precedence, Auto-Submitted)
+  // Cas 2 : signal RFC bulk indexé (List-ID, Feedback-ID, Precedence, Auto-Submitted)
   // → on a la confirmation bulk via extended props, on body-scan direct.
+  // Même critère pour Junk et Inbox : on ne capte QUE le bulk vrai (newsletters/notifs/auto/pub),
+  // les cold pitches B2B (founders, recruteurs) qui finissent dans Junk restent invisibles
+  // à l'add-in pour que l'user puisse les retrouver manuellement dans son dossier Indésirables.
   const bulk = extractBulkSignals(headers);
   if (bulk.isBulk) {
     bulkReasonCounts[bulk.reason] = (bulkReasonCounts[bulk.reason] || 0) + 1;
@@ -661,9 +667,9 @@ function processMessageIntoGroups(d, folder) {
     return;
   }
 
-  // Cas 4 : Inbox sans aucun signal extended → on garde sous le coude pour la 2e passe
-  // Defender (qui tirera internetMessageHeaders pour lire BCL/CAT, headers non indexés
-  // dans PSETID_InternetHeaders).
+  // Cas 3 : aucun signal extended → 2e passe Defender (tire internetMessageHeaders pour
+  // lire BCL/CAT, headers non indexés dans PSETID_InternetHeaders).
+  // S'applique à Junk ET Inbox — la décision finale "bulk ou pas" revient à Defender BCL/CAT:BULK.
   needsDefenderCheck.push({ id: d.id, folder, senderEmail, sender, subject: d.subject });
 }
 
@@ -692,11 +698,28 @@ async function scanBodiesForUnsubLinks(candidates, token) {
     dbg(`Body scan : ${slice.length} expéditeur(s) unique(s) — ${candidates.length} email(s) couverts (dédoublonné)`);
   }
 
+  // Helper interne : crée un groupe "no-method" (suppression seule) pour un entry
+  // dont on n'a pas pu extraire de lien unsub. L'utilisateur voit quand même
+  // l'expéditeur dans la liste et peut le sélectionner pour suppression en masse.
+  const createNoMethodGroup = (entry) => {
+    const info = {
+      oneClickUrl: null, mailtoUrl: null, httpsUrl: null,
+      displayLabel: "", method: null, source: "no-method"
+    };
+    const g = findOrCreateGroup(entry.rep.senderEmail, info, entry.rep.sender);
+    g.folders.add(entry.rep.folder);
+    g.emails.push({ id: entry.rep.id, subject: entry.rep.subject || "(sans objet)", folder: entry.rep.folder });
+    for (const sib of entry.siblings) {
+      g.folders.add(sib.folder);
+      g.emails.push({ id: sib.id, subject: sib.subject || "(sans objet)", folder: sib.folder });
+    }
+  };
+
   const BATCH = 20, CONCURRENCY = 3;
   const batches = [];
   for (let i = 0; i < slice.length; i += BATCH) batches.push(slice.slice(i, i + BATCH));
 
-  let found = 0;
+  let found = 0, noMethod = 0;
   for (let i = 0; i < batches.length; i += CONCURRENCY) {
     const wave = batches.slice(i, i + CONCURRENCY);
     await Promise.all(wave.map(async chunk => {
@@ -707,33 +730,56 @@ async function scanBodiesForUnsubLinks(candidates, token) {
       }));
       try {
         const resp = await callGraph("https://graph.microsoft.com/v1.0/$batch", "POST", { requests }, token);
-        for (const r of (resp.responses || [])) {
-          if (r.status !== 200 || !r.body) continue;
-          const entry = chunk[parseInt(r.id)];
-          if (!entry) continue;
-          const url = extractBodyUnsubLink(r.body.body);
-          if (!url) continue;
-          const info = {
-            oneClickUrl: null, mailtoUrl: null, httpsUrl: url,
-            displayLabel: "", method: "http-auto", source: "body"
-          };
-          try { info.displayLabel = new URL(url).hostname; }
-          catch { info.displayLabel = url.substring(0, 40); }
+        // Index par id pour gérer responses out-of-order et entrées manquantes
+        const respById = {};
+        for (const r of (resp.responses || [])) respById[String(r.id)] = r;
 
-          // Le rep + tous les siblings (non scannés) atterrissent dans le même groupe
-          const g = findOrCreateGroup(entry.rep.senderEmail, info, entry.rep.sender);
-          g.folders.add(entry.rep.folder);
-          g.emails.push({ id: entry.rep.id, subject: entry.rep.subject || "(sans objet)", folder: entry.rep.folder });
-          for (const sib of entry.siblings) {
-            g.folders.add(sib.folder);
-            g.emails.push({ id: sib.id, subject: sib.subject || "(sans objet)", folder: sib.folder });
+        for (let idx = 0; idx < chunk.length; idx++) {
+          const entry = chunk[idx];
+          const r = respById[String(idx)];
+          let url = null;
+          if (r && r.status === 200 && r.body) {
+            url = extractBodyUnsubLink(r.body.body);
           }
-          found++;
+
+          if (url) {
+            // Lien unsub trouvé → groupe avec méthode http-auto
+            const info = {
+              oneClickUrl: null, mailtoUrl: null, httpsUrl: url,
+              displayLabel: "", method: "http-auto", source: "body"
+            };
+            try { info.displayLabel = new URL(url).hostname; }
+            catch { info.displayLabel = url.substring(0, 40); }
+
+            const g = findOrCreateGroup(entry.rep.senderEmail, info, entry.rep.sender);
+            g.folders.add(entry.rep.folder);
+            g.emails.push({ id: entry.rep.id, subject: entry.rep.subject || "(sans objet)", folder: entry.rep.folder });
+            for (const sib of entry.siblings) {
+              g.folders.add(sib.folder);
+              g.emails.push({ id: sib.id, subject: sib.subject || "(sans objet)", folder: sib.folder });
+            }
+            found++;
+          } else {
+            // Pas de lien (corps vide, regex no-match, fetch raté) → groupe no-method
+            // L'user voit quand même le sender et peut le supprimer en masse.
+            createNoMethodGroup(entry);
+            noMethod++;
+          }
         }
-      } catch (err) { dbg(`Body batch: ${err.message}`, "warn"); }
+      } catch (err) {
+        dbg(`Body batch: ${err.message}`, "warn");
+        // Batch entier perdu → fallback no-method pour chaque entry du chunk
+        for (const entry of chunk) { createNoMethodGroup(entry); noMethod++; }
+      }
     }));
   }
-  dbg(`Body scan : ${found} expéditeur(s) trouvé(s) via corps`, found > 0 ? "ok" : "info");
+
+  // Overflow (>MAX senders) : pas de body fetch, juste no-method direct
+  if (entries.length > MAX) {
+    for (const entry of entries.slice(MAX)) { createNoMethodGroup(entry); noMethod++; }
+  }
+
+  dbg(`Body scan : ${found} avec lien unsub, ${noMethod} en suppression seule`, found + noMethod > 0 ? "ok" : "info");
 }
 
 // ============================================================
@@ -1032,15 +1078,18 @@ document.getElementById("btn-scan").addEventListener("click", async () => {
     const totalScanned = scannedCounts.junk + scannedCounts.inbox;
 
     // Agrège les méthodes pour la télémétrie (compteurs uniquement, aucun contenu)
-    const methodCounts = { one_click: 0, mailto: 0, http_auto: 0, popup: 0 };
-    let headerGroups = 0, bodyGroups = 0;
+    const methodCounts = { one_click: 0, mailto: 0, http_auto: 0, popup: 0, none: 0 };
+    let headerGroups = 0, bodyGroups = 0, noMethodGroups = 0;
     for (const g of active) {
       const m = g.info.method;
       if (m === "one-click") methodCounts.one_click++;
       else if (m === "graph-mailto") methodCounts.mailto++;
       else if (m === "http-auto") methodCounts.http_auto++;
       else if (m === "popup") methodCounts.popup++;
-      if (g.info.source === "body") bodyGroups++; else headerGroups++;
+      else { methodCounts.none++; noMethodGroups++; }
+      if (g.info.source === "body") bodyGroups++;
+      else if (g.info.source === "no-method") {} // déjà compté ci-dessus
+      else headerGroups++;
     }
     // Ventilation des raisons de classification bulk (debug)
     const bulkSummary = Object.entries(bulkReasonCounts)
@@ -1075,6 +1124,8 @@ document.getElementById("btn-scan").addEventListener("click", async () => {
       methods_mailto: methodCounts.mailto,
       methods_http_auto: methodCounts.http_auto,
       methods_popup: methodCounts.popup,
+      methods_none: methodCounts.none,
+      no_method_groups: noMethodGroups,
       bulk_inbox_via_bcl: bulkByCategory.bcl,
       bulk_inbox_via_cat: bulkByCategory.cat,
       bulk_inbox_via_list_id: bulkByCategory.list_id,
@@ -1169,13 +1220,14 @@ function renderResults() {
         ? `<span class="folder-badge junk">Junk</span>`
         : `<span class="folder-badge inbox">Inbox</span>`;
 
-    const label = group.info.displayLabel || "";
-    const methodIcon  = { "one-click": "⚡", "graph-mailto": "✉️", "http-auto": "🤫", "popup": "🔗" }[group.info.method] || "🔗";
-    const methodLabel = { "one-click": "1-clic RFC 8058", "graph-mailto": "mail auto", "http-auto": "GET silencieux", "popup": "page web" }[group.info.method] || "";
-    const fullUrl = group.info.oneClickUrl || group.info.httpsUrl || group.info.mailtoUrl || "";
+    const noMethod    = !group.info.method;
+    const label       = group.info.displayLabel || "";
+    const methodIcon  = { "one-click": "⚡", "graph-mailto": "✉️", "http-auto": "🤫", "popup": "🔗" }[group.info.method] || "○";
+    const methodLabel = { "one-click": "1-clic RFC 8058", "graph-mailto": "mail auto", "http-auto": "GET silencieux", "popup": "page web" }[group.info.method] || "suppression seule";
+    const fullUrl     = group.info.oneClickUrl || group.info.httpsUrl || group.info.mailtoUrl || "";
 
     const div = document.createElement("div");
-    div.className = "group-item";
+    div.className = "group-item" + (noMethod ? " no-method" : "");
     div.dataset.idx = idx;
     div.innerHTML = `
       <div class="group-header">
@@ -1199,10 +1251,11 @@ function renderResults() {
 
     container.appendChild(div);
 
-    // Restaure l'état vert/désactivé si l'utilisateur a déjà cliqué Se désinscrire
+    // Restaure l'état (vert ou neutre gris) si l'utilisateur a déjà cliqué Se désinscrire
     // sur ce groupe avant qu'un re-render (post body-scan) n'ait lieu.
     if (group.unsubDone) {
-      applySuccessStyle(div, unsubBtn, group.unsubDoneLabel || "✅ Désinscrit");
+      if (group.unsubNeutral) applyNeutralStyle(div, unsubBtn, group.unsubDoneLabel || "○ Sans unsub");
+      else                     applySuccessStyle(div, unsubBtn, group.unsubDoneLabel || "✅ Désinscrit");
     }
   });
 
@@ -1222,6 +1275,17 @@ async function executeUnsubscribe(idx, cardEl, unsubBtn, deleteBtn) {
   const group = groups[idx];
   if (!group) return;
   const info = group.info;
+
+  // Cas no-method : aucun mécanisme de désinscription disponible (cold spam, body sans lien).
+  // On marque la carte en gris neutre, on n'erreur pas — l'user voit clairement qu'il
+  // ne reste qu'à cliquer Supprimer. Pas de fetch, pas de popup.
+  if (!info.method) {
+    markCardNeutral(cardEl, unsubBtn, `○ Sans unsub — supprime`);
+    setStatus(`${group.sender} : pas de méthode de désinscription standard. Clique 🗑️ Supprimer pour jeter ${group.emails.length} email(s).`);
+    track("unsub_executed", { method: "none", success: false, source: info.source || "no-method", bulk: false });
+    return;
+  }
+
   unsubBtn.disabled = true;
   const origLabel = unsubBtn.textContent;
   unsubBtn.textContent = "⏳…";
@@ -1371,6 +1435,20 @@ function applySuccessStyle(cardEl, unsubBtn, label) {
   unsubBtn.disabled = true;
 }
 
+// Style neutre (gris) pour les groupes sans méthode de désinscription.
+// Utilisé quand l'user clique "Se désinscrire" sur un groupe no-method :
+// on signale visuellement qu'aucune action n'est tentée, sans erreur. L'user
+// distingue d'un coup d'œil les groupes désinscrits (vert) vs ceux qui ne
+// peuvent que partir à la corbeille (gris).
+function applyNeutralStyle(cardEl, unsubBtn, label) {
+  cardEl.style.transition = "background 0.3s, border-color 0.3s";
+  unsubBtn.textContent = label;
+  unsubBtn.style.color = "#605e5c";
+  unsubBtn.style.borderColor = "#c8c6c4";
+  unsubBtn.style.background = "#f3f2f1";
+  unsubBtn.disabled = true;
+}
+
 // Persiste l'état "désinscrit" sur le groupe pour qu'un re-render incrémental
 // (après que le body-scan ait terminé) ne perde pas le visuel vert/désactivé.
 function markCardSuccess(cardEl, unsubBtn, label) {
@@ -1380,6 +1458,16 @@ function markCardSuccess(cardEl, unsubBtn, label) {
     groups[idx].unsubDoneLabel = label;
   }
   applySuccessStyle(cardEl, unsubBtn, label);
+}
+
+function markCardNeutral(cardEl, unsubBtn, label) {
+  const idx = parseInt(cardEl.dataset.idx);
+  if (!isNaN(idx) && groups[idx]) {
+    groups[idx].unsubDone = true;
+    groups[idx].unsubDoneLabel = label;
+    groups[idx].unsubNeutral = true;
+  }
+  applyNeutralStyle(cardEl, unsubBtn, label);
 }
 
 // ============================================================
@@ -1513,8 +1601,9 @@ document.getElementById("btn-unsub-bulk").addEventListener("click", async () => 
   const httpAutoIdx = checked.filter(i => groups[i]?.info.method === "http-auto");
   const mailtoIdx   = checked.filter(i => groups[i]?.info.method === "graph-mailto");
   const popupIdx    = checked.filter(i => groups[i]?.info.method === "popup");
+  const noMethodIdx = checked.filter(i => groups[i] && !groups[i].info.method);
 
-  dbg(`Bulk : ${oneClickIdx.length} one-click, ${httpAutoIdx.length} http-auto, ${mailtoIdx.length} mailto, ${popupIdx.length} popup`);
+  dbg(`Bulk : ${oneClickIdx.length} one-click, ${httpAutoIdx.length} http-auto, ${mailtoIdx.length} mailto, ${popupIdx.length} popup, ${noMethodIdx.length} sans méthode`);
 
   let ok = 0, errors = 0;
 
@@ -1576,13 +1665,26 @@ document.getElementById("btn-unsub-bulk").addEventListener("click", async () => 
     } catch (e) { dbg(`Bulk mailto token: ${e.message}`, "err"); }
   }
 
+  // --- Sans méthode : marquer en gris neutre, pas d'action unsub (juste signal visuel) ---
+  if (noMethodIdx.length > 0) {
+    for (const i of noMethodIdx) {
+      const card = document.querySelector(`.group-item[data-idx="${i}"]`);
+      const unsubBtn = card?.querySelector(".btn-sm.unsub");
+      if (card && unsubBtn) markCardNeutral(card, unsubBtn, `○ Sans unsub`);
+      track("unsub_executed", { method: "none", success: false, source: groups[i]?.info.source || "no-method", bulk: true });
+    }
+  }
+
   // --- Popup : rare maintenant (seulement si rien d'auto), traité un par un ---
   let msg = `✅ ${ok} désinscription(s) envoyée(s)`;
   if (errors > 0) msg += `, ${errors} erreur(s)`;
+  if (noMethodIdx.length > 0) {
+    msg += `. ○ ${noMethodIdx.length} expéditeur(s) sans méthode (à supprimer manuellement).`;
+  }
   if (popupIdx.length > 0) {
     msg += `. ⚠️ ${popupIdx.length} expéditeur(s) nécessitent une page web — clique "Se désinscrire" sur chacun.`;
   }
-  if (ok > 0) msg += ` Utilise 🗑️ Supprimer (sélectionnés) pour jeter les emails existants.`;
+  if (ok > 0 || noMethodIdx.length > 0) msg += ` Utilise 🗑️ Supprimer (sélectionnés) pour jeter les emails.`;
   setStatus(msg);
 
   btn.disabled = false;
