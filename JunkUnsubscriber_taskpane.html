@@ -720,6 +720,10 @@ async function scanBodiesForUnsubLinks(candidates, token) {
   for (let i = 0; i < slice.length; i += BATCH) batches.push(slice.slice(i, i + BATCH));
 
   let found = 0, noMethod = 0;
+  const foundNames = [];     // pour debug : qui a un lien unsub trouvé
+  const noMethodNames = [];  // pour debug : qui finit en "suppression seule"
+  const labelOf = (entry) => entry.rep.sender || entry.rep.senderEmail || "?";
+
   for (let i = 0; i < batches.length; i += CONCURRENCY) {
     const wave = batches.slice(i, i + CONCURRENCY);
     await Promise.all(wave.map(async chunk => {
@@ -759,27 +763,44 @@ async function scanBodiesForUnsubLinks(candidates, token) {
               g.emails.push({ id: sib.id, subject: sib.subject || "(sans objet)", folder: sib.folder });
             }
             found++;
+            if (foundNames.length < 20) foundNames.push(labelOf(entry));
           } else {
             // Pas de lien (corps vide, regex no-match, fetch raté) → groupe no-method
             // L'user voit quand même le sender et peut le supprimer en masse.
             createNoMethodGroup(entry);
             noMethod++;
+            if (noMethodNames.length < 20) noMethodNames.push(labelOf(entry));
           }
         }
       } catch (err) {
         dbg(`Body batch: ${err.message}`, "warn");
         // Batch entier perdu → fallback no-method pour chaque entry du chunk
-        for (const entry of chunk) { createNoMethodGroup(entry); noMethod++; }
+        for (const entry of chunk) {
+          createNoMethodGroup(entry);
+          noMethod++;
+          if (noMethodNames.length < 20) noMethodNames.push(labelOf(entry) + " (fetch fail)");
+        }
       }
     }));
   }
 
   // Overflow (>MAX senders) : pas de body fetch, juste no-method direct
   if (entries.length > MAX) {
-    for (const entry of entries.slice(MAX)) { createNoMethodGroup(entry); noMethod++; }
+    for (const entry of entries.slice(MAX)) {
+      createNoMethodGroup(entry);
+      noMethod++;
+      if (noMethodNames.length < 20) noMethodNames.push(labelOf(entry) + " (overflow)");
+    }
   }
 
   dbg(`Body scan : ${found} avec lien unsub, ${noMethod} en suppression seule`, found + noMethod > 0 ? "ok" : "info");
+  // Détail par sender pour debug — limité à 20 noms pour pas spammer le panel
+  if (foundNames.length > 0) {
+    dbg(`  ↳ avec lien : ${foundNames.join(", ")}${found > 20 ? ` (+${found - 20})` : ""}`, "info");
+  }
+  if (noMethodNames.length > 0) {
+    dbg(`  ↳ suppression seule : ${noMethodNames.join(", ")}${noMethod > 20 ? ` (+${noMethod - 20})` : ""}`, "info");
+  }
 }
 
 // ============================================================
@@ -820,7 +841,11 @@ async function checkDefenderForCandidates(candidates, token) {
   const batches = [];
   for (let i = 0; i < slice.length; i += BATCH) batches.push(slice.slice(i, i + BATCH));
 
-  let bulkFound = 0;
+  let bulkFound = 0, notBulk = 0;
+  const bulkDetails = [];   // pour debug : "sender (BCL:5)" pour les confirmés bulk
+  const ignoredNames = [];  // pour debug : senders non-bulk (Defender les juge OK → ignorés)
+  const labelOf = (entry) => entry.rep.sender || entry.rep.senderEmail || "?";
+
   for (let i = 0; i < batches.length; i += CONCURRENCY) {
     const wave = batches.slice(i, i + CONCURRENCY);
     await Promise.all(wave.map(async chunk => {
@@ -837,9 +862,14 @@ async function checkDefenderForCandidates(candidates, token) {
           if (!entry) continue;
           const headers = r.body.internetMessageHeaders || [];
           const bulk = extractBulkSignals(headers);
-          if (!bulk.isBulk) continue;
+          if (!bulk.isBulk) {
+            notBulk++;
+            if (ignoredNames.length < 15) ignoredNames.push(labelOf(entry) + (bulk.bcl !== null ? ` (BCL:${bulk.bcl})` : ""));
+            continue;
+          }
           bulkReasonCounts[bulk.reason] = (bulkReasonCounts[bulk.reason] || 0) + 1;
           bulkFound++;
+          if (bulkDetails.length < 20) bulkDetails.push(`${labelOf(entry)} (${bulk.reason})`);
           // Rep + siblings deviennent candidats body-scan
           bodyScanCandidates.push({ ...entry.rep });
           for (const sib of entry.siblings) bodyScanCandidates.push({ ...sib });
@@ -847,7 +877,13 @@ async function checkDefenderForCandidates(candidates, token) {
       } catch (err) { dbg(`Defender batch: ${err.message}`, "warn"); }
     }));
   }
-  dbg(`Defender check : ${bulkFound} expéditeur(s) bulk identifié(s)`, bulkFound > 0 ? "ok" : "info");
+  dbg(`Defender check : ${bulkFound} bulk, ${notBulk} ignorés (jugés humains/légitimes)`, bulkFound > 0 ? "ok" : "info");
+  if (bulkDetails.length > 0) {
+    dbg(`  ↳ confirmés bulk : ${bulkDetails.join(", ")}${bulkFound > 20 ? ` (+${bulkFound - 20})` : ""}`, "info");
+  }
+  if (ignoredNames.length > 0) {
+    dbg(`  ↳ ignorés (resteront en place) : ${ignoredNames.join(", ")}${notBulk > 15 ? ` (+${notBulk - 15})` : ""}`, "info");
+  }
 }
 
 // ============================================================
