@@ -99,10 +99,38 @@
     .hidden { display: none !important; }
 
     /* Debug panel */
-    #debug-panel { display: none; position: fixed; bottom: 0; left: 0; right: 0; max-height: 40vh; background: #1e1e1e; color: #d4d4d4; font-family: 'Consolas','Courier New',monospace; font-size: 10px; overflow-y: auto; padding: 8px; z-index: 998; border-top: 2px solid #0078d4; }
+    #debug-panel { display: none; position: fixed; bottom: 0; left: 0; right: 0; max-height: 60vh; background: #1e1e1e; color: #d4d4d4; font-family: 'Consolas','Courier New',monospace; font-size: 10px; overflow-y: auto; padding: 8px; z-index: 998; border-top: 2px solid #0078d4; }
     #debug-panel.visible { display: block; }
     .dbg-info { color: #9cdcfe; } .dbg-ok { color: #4ec9b0; } .dbg-warn { color: #dcdcaa; } .dbg-err { color: #f44747; }
     .dbg-line { margin-bottom: 2px; white-space: pre-wrap; word-break: break-all; }
+
+    /* Per-sender trace table — affiche tous les senders vus pendant le scan
+       avec leurs signaux Defender/RFC + verdict. C'est l'outil principal de
+       diagnostic "pourquoi tel mail n'a pas été classé bulk". */
+    #trace-table-wrap { margin: 6px 0 10px; border-top: 1px dashed #444; padding-top: 6px; }
+    #trace-table-head { color: #c586c0; font-weight: 600; margin-bottom: 4px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    #trace-filter { background: #2d2d2d; color: #d4d4d4; border: 1px solid #444; padding: 2px 5px; font-family: inherit; font-size: 10px; flex: 1; min-width: 100px; }
+    #trace-filter::placeholder { color: #6a6a6a; }
+    .trace-pill { display: inline-block; padding: 1px 6px; border-radius: 8px; font-size: 9px; font-weight: 600; }
+    .trace-pill.all     { background: #3a3a3a; color: #d4d4d4; }
+    .trace-pill.bulk    { background: #1d4d2f; color: #4ec9b0; }
+    .trace-pill.notbulk { background: #4d1d1d; color: #f48771; }
+    .trace-pill.dropped { background: #4d3a1d; color: #dcdcaa; }
+    #trace-table { width: 100%; border-collapse: collapse; font-size: 9px; }
+    #trace-table th { text-align: left; padding: 3px 4px; background: #2d2d2d; color: #c586c0; font-weight: 600; position: sticky; top: 0; }
+    #trace-table td { padding: 2px 4px; border-bottom: 1px solid #2a2a2a; vertical-align: top; }
+    #trace-table tr.bulk    td { background: rgba(78, 201, 176, 0.05); }
+    #trace-table tr.notbulk td { background: rgba(244, 71, 71, 0.05); }
+    #trace-table tr.dropped td { background: rgba(220, 220, 170, 0.05); }
+    #trace-table tr:hover td { background: rgba(0, 120, 212, 0.15); }
+    .trace-sig-yes { color: #4ec9b0; font-weight: 600; }
+    .trace-sig-no  { color: #5a5a5a; }
+    .trace-out-grouped_header     { color: #4ec9b0; }
+    .trace-out-grouped_body       { color: #4ec9b0; }
+    .trace-out-grouped_no_method  { color: #dcdcaa; }
+    .trace-out-rejected_defender  { color: #f48771; }
+    .trace-out-dropped_no_sender  { color: #f48771; }
+    .trace-out-still_pending      { color: #f44747; font-weight: 600; }
   </style>
 </head>
 <body>
@@ -149,7 +177,26 @@
 
 <div class="disclaimer">Certains spams passent à travers (pas de lien détectable, ou format non reconnu). Certains sites ignorent la désinscription automatique et exigent une confirmation sur leur page.</div>
 
-<div id="debug-panel"></div>
+<div id="debug-panel">
+  <div id="trace-table-wrap" style="display:none">
+    <div id="trace-table-head">
+      <span>📊 Per-sender trace</span>
+      <input id="trace-filter" type="text" placeholder="Filtrer (domaine, outcome, raison)..." oninput="renderTraceTable()" />
+      <span id="trace-summary"></span>
+    </div>
+    <table id="trace-table">
+      <thead><tr>
+        <th>Domaine</th><th title="Nombre de mails">#</th><th>Dossier</th>
+        <th title="Bulk Complaint Level (Defender)">BCL</th><th>CAT</th>
+        <th title="List-Unsubscribe">LU</th><th title="List-ID">LID</th>
+        <th title="Feedback-ID">FB</th><th title="Precedence">PR</th><th title="Auto-Submitted">AS</th>
+        <th>Classif.</th><th>Outcome</th><th>Raison</th><th>Méthode</th>
+      </tr></thead>
+      <tbody id="trace-table-body"></tbody>
+    </table>
+  </div>
+  <div id="debug-log"></div>
+</div>
 
 <script>
 // ============================================================
@@ -178,12 +225,89 @@ function dbg(msg, level = "info") {
   renderDebug();
 }
 function renderDebug() {
+  // Le log texte vit dans #debug-log (sous la trace table). #debug-panel est le conteneur scrollable.
+  const log = document.getElementById("debug-log");
+  if (!log) return;
+  log.innerHTML = debugLines.map(d => `<div class="dbg-line ${d.cls}">${escHtml(d.line)}</div>`).join("");
   const p = document.getElementById("debug-panel");
-  if (!p) return;
-  p.innerHTML = debugLines.map(d => `<div class="dbg-line ${d.cls}">${escHtml(d.line)}</div>`).join("");
-  p.scrollTop = p.scrollHeight;
+  if (p) p.scrollTop = p.scrollHeight;
 }
 function toggleDebug() { document.getElementById("debug-panel").classList.toggle("visible"); }
+
+// Affiche la table par-sender. Appelée après chaque phase du scan (initial / Defender / body)
+// pour que l'user voie les outcomes converger en temps réel s'il ouvre le panel pendant.
+// Filtre live : input plain-text sur domaine OU outcome OU raison.
+function renderTraceTable() {
+  const wrap = document.getElementById("trace-table-wrap");
+  const body = document.getElementById("trace-table-body");
+  const summary = document.getElementById("trace-summary");
+  if (!wrap || !body) return;
+  if (senderTrace.size === 0) { wrap.style.display = "none"; return; }
+  wrap.style.display = "block";
+
+  const filterRaw = (document.getElementById("trace-filter")?.value || "").toLowerCase().trim();
+  const allEntries = [...senderTrace.values()];
+  // Tri : outcomes "à problème" en haut (rejected/pending/dropped/no_method), puis bulk OK
+  const order = { still_pending: 0, dropped_no_sender: 1, rejected_defender: 2, grouped_no_method: 3, grouped_body: 4, grouped_header: 5 };
+  allEntries.sort((a, b) => (order[a.outcome] ?? 9) - (order[b.outcome] ?? 9) || b.mailCount - a.mailCount);
+
+  // Compteurs par classification — affichés à droite du titre
+  let bulkN = 0, notBulkN = 0, droppedN = 0, pendingN = 0;
+  for (const t of allEntries) {
+    if (t.classification === "bulk") bulkN++;
+    else if (t.classification === "not-bulk") notBulkN++;
+    else if (t.classification === "no-sender") droppedN++;
+    else pendingN++;
+  }
+  if (summary) {
+    summary.innerHTML =
+      `<span class="trace-pill all">${allEntries.length} senders</span> ` +
+      `<span class="trace-pill bulk">${bulkN} bulk</span> ` +
+      `<span class="trace-pill notbulk">${notBulkN} rejetés</span>` +
+      (droppedN ? ` <span class="trace-pill dropped">${droppedN} sans expé.</span>` : "") +
+      (pendingN ? ` <span class="trace-pill dropped">${pendingN} pending</span>` : "");
+  }
+
+  const sig = (v) => v ? '<span class="trace-sig-yes">✓</span>' : '<span class="trace-sig-no">·</span>';
+  const fmtBcl = (t) => {
+    if (t.signals.bcl_min === null) return '<span class="trace-sig-no">·</span>';
+    return t.signals.bcl_min === t.signals.bcl_max
+      ? String(t.signals.bcl_min)
+      : `${t.signals.bcl_min}-${t.signals.bcl_max}`;
+  };
+  const fmtFolders = (t) => [...t.folders].map(f => f === "junk" ? "🗑" : "📥").join(" ") || "—";
+  const classRow = (t) =>
+    t.classification === "bulk"      ? "bulk"
+    : t.classification === "not-bulk"? "notbulk"
+    : t.classification === "no-sender"? "dropped"
+    : "";
+
+  const filtered = filterRaw
+    ? allEntries.filter(t =>
+        t.domain.toLowerCase().includes(filterRaw) ||
+        t.outcome.toLowerCase().includes(filterRaw) ||
+        (t.bulkReason || "").toLowerCase().includes(filterRaw))
+    : allEntries;
+
+  body.innerHTML = filtered.map(t => `
+    <tr class="${classRow(t)}" title="${escHtml(t.sampleEmail)}">
+      <td>${escHtml(t.domain)}</td>
+      <td>${t.mailCount}</td>
+      <td>${fmtFolders(t)}</td>
+      <td>${fmtBcl(t)}</td>
+      <td>${t.signals.cat ? escHtml(t.signals.cat) : '<span class="trace-sig-no">·</span>'}</td>
+      <td>${sig(t.signals.has_list_unsubscribe)}</td>
+      <td>${sig(t.signals.has_list_id)}</td>
+      <td>${sig(t.signals.has_feedback_id)}</td>
+      <td>${sig(t.signals.has_precedence)}</td>
+      <td>${sig(t.signals.has_auto_submitted)}</td>
+      <td>${escHtml(t.classification)}</td>
+      <td class="trace-out-${escHtml(t.outcome)}">${escHtml(t.outcome)}</td>
+      <td>${escHtml(t.bulkReason || "—")}</td>
+      <td>${escHtml(t.unsubMethod || "—")}</td>
+    </tr>
+  `).join("");
+}
 
 // ============================================================
 // TELEMETRY (PostHog)
@@ -574,6 +698,73 @@ let bulkReasonCounts = {};
 // (nom "magique" deleteditems → vrai ID + displayName localisé)
 let deletedItemsFolder = null;
 
+// ============================================================
+// SENDER TRACE — diagnostic complet par expéditeur
+// ============================================================
+// Map<domain, traceEntry> qui accumule pour CHAQUE expéditeur vu pendant un scan :
+// signaux Defender/RFC vus, classification, outcome final. Sert au debug panel
+// (table par-sender) et à PostHog (1 event "sender_inspected" par domaine par scan).
+//
+// On clé par groupingKey() (= domaine racine) pour fusionner les variantes VERP /
+// sous-domaines : 1 entrée pour "linkedin.com" même si on a vu news@e.linkedin.com,
+// noreply@m.linkedin.com et invites@linkedin.com.
+//
+// Outcomes possibles (état final post-scan) :
+//   "grouped_header"     → Cas 1 : List-Unsubscribe header → action disponible
+//   "grouped_body"       → Cas 2/3 → body scan a trouvé un lien
+//   "grouped_no_method"  → Cas 2/3 → bulk confirmé mais aucun lien trouvé (suppression seule)
+//   "rejected_defender"  → Defender check : BCL=0 + pas de signal RFC → ignoré
+//   "dropped_no_sender"  → mail sans champ from (rare, mais ça arrive)
+//   "still_pending"      → shouldn't happen (= bug pipeline si on en voit)
+let senderTrace = new Map();
+
+function getOrCreateTrace(senderEmail, sender, folder) {
+  const key = groupingKey(senderEmail);
+  let t = senderTrace.get(key);
+  if (!t) {
+    t = {
+      domain: key,                         // sert d'identifiant + envoyé à PostHog
+      sampleEmail: senderEmail || "",      // pour affichage debug uniquement (jamais PostHog)
+      sampleName: sender || senderEmail || "(inconnu)",
+      folders: new Set(),
+      mailCount: 0,
+      signals: {
+        bcl_min: null, bcl_max: null, cat: null,
+        has_list_unsubscribe: false, has_list_id: false,
+        has_feedback_id: false, has_precedence: false, has_auto_submitted: false
+      },
+      classification: "pending",   // "bulk" | "not-bulk" | "pending" | "no-sender"
+      bulkReason: null,            // ex: "BCL:5", "CAT:BULK", "List-ID", "no-signal"
+      outcome: "still_pending",    // voir enum ci-dessus
+      unsubMethod: null            // "one-click" | "graph-mailto" | "http-auto" | "popup" | null
+    };
+    senderTrace.set(key, t);
+  }
+  if (folder) t.folders.add(folder);
+  t.mailCount++;
+  return t;
+}
+
+// Marque sur le trace entry les signaux observés dans un set de headers.
+// Mis à jour à chaque mail (le min/max de BCL est utile : un sender peut avoir
+// des mails avec BCL différents si Outlook a updaté la réputation entre temps).
+function updateTraceSignals(trace, headers, bulkResult) {
+  if (!Array.isArray(headers)) return;
+  const byName = (n) => headers.find(h => h.name && h.name.toLowerCase() === n.toLowerCase());
+  if (byName("list-unsubscribe")) trace.signals.has_list_unsubscribe = true;
+  if (byName("list-id"))          trace.signals.has_list_id          = true;
+  if (byName("feedback-id"))      trace.signals.has_feedback_id      = true;
+  if (byName("precedence"))       trace.signals.has_precedence       = true;
+  if (byName("auto-submitted"))   trace.signals.has_auto_submitted   = true;
+  if (bulkResult) {
+    if (bulkResult.bcl !== null && bulkResult.bcl !== undefined) {
+      if (trace.signals.bcl_min === null || bulkResult.bcl < trace.signals.bcl_min) trace.signals.bcl_min = bulkResult.bcl;
+      if (trace.signals.bcl_max === null || bulkResult.bcl > trace.signals.bcl_max) trace.signals.bcl_max = bulkResult.bcl;
+    }
+    if (bulkResult.cat) trace.signals.cat = bulkResult.cat;
+  }
+}
+
 async function getDeletedItemsFolder(token) {
   if (deletedItemsFolder) return deletedItemsFolder;
   const resp = await callGraph(
@@ -643,6 +834,17 @@ function processMessageIntoGroups(d, folder) {
   const senderEmail = d.from?.emailAddress?.address || "";
   const sender      = d.from?.emailAddress?.name || senderEmail || "Inconnu";
 
+  // Trace : on commence à enregistrer ce mail dans senderTrace dès qu'on a un sender.
+  // Les mails sans sender sont quand même comptabilisés sous la clé "(no-sender)" pour
+  // qu'ils apparaissent dans le diagnostic — sinon ils disparaîtraient silencieusement.
+  const trace = senderEmail
+    ? getOrCreateTrace(senderEmail, sender, folder)
+    : getOrCreateTrace("(no-sender)", "(mail sans expéditeur)", folder);
+  // Pré-calcule bulk pour avoir BCL/CAT même quand on prend la branche Cas 1 (info.method)
+  // — sinon on perdrait l'info "ce mail avait BCL:5 ET un List-Unsubscribe".
+  const preBulk = extractBulkSignals(headers);
+  updateTraceSignals(trace, headers, preBulk);
+
   // Cas 1 : List-Unsubscribe présent → on a une méthode d'action directe (RFC 2369).
   const info = extractUnsubscribeInfo(headers);
   if (info.method) {
@@ -650,20 +852,33 @@ function processMessageIntoGroups(d, folder) {
     const g = findOrCreateGroup(senderEmail, info, sender);
     g.folders.add(folder);
     g.emails.push({ id: d.id, subject: d.subject || "(sans objet)", folder });
+    // Outcome final immédiat : groupé via header. unsubMethod = la meilleure méthode trouvée.
+    trace.classification = "bulk";
+    trace.bulkReason     = preBulk.isBulk ? preBulk.reason : "List-Unsubscribe";
+    trace.outcome        = "grouped_header";
+    trace.unsubMethod    = info.method;
     return;
   }
 
-  if (!senderEmail) return;
+  if (!senderEmail) {
+    // Pas de sender ET pas de List-Unsubscribe → on lâche, mais on TRACE le drop.
+    trace.classification = "no-sender";
+    trace.bulkReason     = preBulk.reason; // ex: "no-signal" ou "BCL:0"
+    trace.outcome        = "dropped_no_sender";
+    return;
+  }
 
   // Cas 2 : signal RFC bulk indexé (List-ID, Feedback-ID, Precedence, Auto-Submitted)
   // → on a la confirmation bulk via extended props, on body-scan direct.
   // Même critère pour Junk et Inbox : on ne capte QUE le bulk vrai (newsletters/notifs/auto/pub),
   // les cold pitches B2B (founders, recruteurs) qui finissent dans Junk restent invisibles
   // à l'add-in pour que l'user puisse les retrouver manuellement dans son dossier Indésirables.
-  const bulk = extractBulkSignals(headers);
-  if (bulk.isBulk) {
-    bulkReasonCounts[bulk.reason] = (bulkReasonCounts[bulk.reason] || 0) + 1;
+  if (preBulk.isBulk) {
+    bulkReasonCounts[preBulk.reason] = (bulkReasonCounts[preBulk.reason] || 0) + 1;
     bodyScanCandidates.push({ id: d.id, folder, senderEmail, sender, subject: d.subject });
+    trace.classification = "bulk";
+    trace.bulkReason     = preBulk.reason;
+    // outcome reste "still_pending" → mis à jour par scanBodiesForUnsubLinks (grouped_body / grouped_no_method)
     return;
   }
 
@@ -671,6 +886,8 @@ function processMessageIntoGroups(d, folder) {
   // lire BCL/CAT, headers non indexés dans PSETID_InternetHeaders).
   // S'applique à Junk ET Inbox — la décision finale "bulk ou pas" revient à Defender BCL/CAT:BULK.
   needsDefenderCheck.push({ id: d.id, folder, senderEmail, sender, subject: d.subject });
+  // outcome temporaire — mis à jour par checkDefenderForCandidates (rejected_defender ou continue body scan)
+  trace.outcome = "defender_pending";
 }
 
 // Scan le body des candidats (emails sans header).
@@ -762,12 +979,17 @@ async function scanBodiesForUnsubLinks(candidates, token) {
               g.folders.add(sib.folder);
               g.emails.push({ id: sib.id, subject: sib.subject || "(sans objet)", folder: sib.folder });
             }
+            // Trace : verdict final — lien dans le body trouvé
+            const trace = senderTrace.get(groupingKey(entry.rep.senderEmail));
+            if (trace) { trace.outcome = "grouped_body"; trace.unsubMethod = "http-auto"; }
             found++;
             if (foundNames.length < 20) foundNames.push(labelOf(entry));
           } else {
             // Pas de lien (corps vide, regex no-match, fetch raté) → groupe no-method
             // L'user voit quand même le sender et peut le supprimer en masse.
             createNoMethodGroup(entry);
+            const trace = senderTrace.get(groupingKey(entry.rep.senderEmail));
+            if (trace) { trace.outcome = "grouped_no_method"; trace.unsubMethod = null; }
             noMethod++;
             if (noMethodNames.length < 20) noMethodNames.push(labelOf(entry));
           }
@@ -777,6 +999,8 @@ async function scanBodiesForUnsubLinks(candidates, token) {
         // Batch entier perdu → fallback no-method pour chaque entry du chunk
         for (const entry of chunk) {
           createNoMethodGroup(entry);
+          const trace = senderTrace.get(groupingKey(entry.rep.senderEmail));
+          if (trace) { trace.outcome = "grouped_no_method"; trace.unsubMethod = null; }
           noMethod++;
           if (noMethodNames.length < 20) noMethodNames.push(labelOf(entry) + " (fetch fail)");
         }
@@ -788,6 +1012,8 @@ async function scanBodiesForUnsubLinks(candidates, token) {
   if (entries.length > MAX) {
     for (const entry of entries.slice(MAX)) {
       createNoMethodGroup(entry);
+      const trace = senderTrace.get(groupingKey(entry.rep.senderEmail));
+      if (trace) { trace.outcome = "grouped_no_method"; trace.unsubMethod = null; }
       noMethod++;
       if (noMethodNames.length < 20) noMethodNames.push(labelOf(entry) + " (overflow)");
     }
@@ -862,14 +1088,28 @@ async function checkDefenderForCandidates(candidates, token) {
           if (!entry) continue;
           const headers = r.body.internetMessageHeaders || [];
           const bulk = extractBulkSignals(headers);
+          // Refresh trace : on a maintenant les VRAIS headers (BCL/CAT) — pas seulement les
+          // extended props indexées. Met à jour signaux + verdict pour la table debug.
+          const trace = senderTrace.get(groupingKey(entry.rep.senderEmail));
+          if (trace) updateTraceSignals(trace, headers, bulk);
           if (!bulk.isBulk) {
             notBulk++;
             if (ignoredNames.length < 15) ignoredNames.push(labelOf(entry) + (bulk.bcl !== null ? ` (BCL:${bulk.bcl})` : ""));
+            if (trace) {
+              trace.classification = "not-bulk";
+              trace.bulkReason     = bulk.reason;          // ex: "BCL:0", "no-signal"
+              trace.outcome        = "rejected_defender";  // verdict final — ce sender restera en place
+            }
             continue;
           }
           bulkReasonCounts[bulk.reason] = (bulkReasonCounts[bulk.reason] || 0) + 1;
           bulkFound++;
           if (bulkDetails.length < 20) bulkDetails.push(`${labelOf(entry)} (${bulk.reason})`);
+          if (trace) {
+            trace.classification = "bulk";
+            trace.bulkReason     = bulk.reason;
+            // outcome reste "defender_pending" en attendant le body scan qui le finalisera
+          }
           // Rep + siblings deviennent candidats body-scan
           bodyScanCandidates.push({ ...entry.rep });
           for (const sib of entry.siblings) bodyScanCandidates.push({ ...sib });
@@ -1045,6 +1285,7 @@ document.getElementById("btn-scan").addEventListener("click", async () => {
   needsDefenderCheck = [];
   scannedCounts = { junk: 0, inbox: 0 };
   bulkReasonCounts = {};
+  senderTrace = new Map();
 
   try {
     const token = await getToken();
@@ -1085,19 +1326,26 @@ document.getElementById("btn-scan").addEventListener("click", async () => {
       document.getElementById("results-container").classList.remove("hidden");
       updateLoadMore();
     }
+    // Trace table en live : rendu après chaque phase pour que le user voie les outcomes converger
+    renderTraceTable();
 
     // 2e passe — Defender check : pour les emails inbox sans aucun signal extended,
     // on tire internetMessageHeaders ciblé pour lire BCL/CAT. Ceux qui ressortent bulk
     // rejoignent bodyScanCandidates pour la 3e passe.
+    let defenderCallsMade = 0;
     if (needsDefenderCheck.length > 0) {
+      defenderCallsMade = needsDefenderCheck.length;
       setStatus(`🔍 Vérification Defender sur ${needsDefenderCheck.length} email(s) ambigu(s)...`);
       await checkDefenderForCandidates(needsDefenderCheck, token);
       needsDefenderCheck = [];
+      renderTraceTable();
     }
 
     // 3e passe — Body scan : pour les emails bulk sans méthode dans le header,
     // on cherche le lien de désinscription dans le corps.
+    let bodyScanCallsMade = 0;
     if (bodyScanCandidates.length > 0) {
+      bodyScanCallsMade = bodyScanCandidates.length;
       const candCount = Math.min(bodyScanCandidates.length, 500);
       setStatus(headerOnlyCount > 0
         ? `✅ ${headerOnlyCount} expéditeur(s) trouvé(s) · 🔎 Analyse approfondie de ${candCount} email(s)...`
@@ -1108,6 +1356,7 @@ document.getElementById("btn-scan").addEventListener("click", async () => {
       renderResults();
       document.getElementById("results-container").classList.remove("hidden");
       updateLoadMore();
+      renderTraceTable();
     }
 
     const active = groups.filter(Boolean);
@@ -1146,6 +1395,24 @@ document.getElementById("btn-scan").addEventListener("click", async () => {
       else if (reason === "List-Unsubscribe") bulkByCategory.list_unsubscribe_only += count;
     }
 
+    // === Agrégats par-sender (depuis senderTrace) — diagnostics post-scan ===
+    // On compte les outcomes pour avoir un breakdown clair dans scan_completed,
+    // puis on émet 1 event "sender_inspected" par domaine pour les diagnostics fins
+    // ("quel domaine a échappé, avec quels signaux ?") sans envoyer d'adresse complète.
+    const outcomeCounts = {
+      grouped_header: 0, grouped_body: 0, grouped_no_method: 0,
+      rejected_defender: 0, dropped_no_sender: 0, still_pending: 0
+    };
+    let sendersWithBcl = 0, sendersWithCat = 0, sendersWithListUnsub = 0;
+    let mailsInspected = 0;
+    for (const t of senderTrace.values()) {
+      outcomeCounts[t.outcome] = (outcomeCounts[t.outcome] || 0) + 1;
+      mailsInspected += t.mailCount;
+      if (t.signals.bcl_max !== null) sendersWithBcl++;
+      if (t.signals.cat)              sendersWithCat++;
+      if (t.signals.has_list_unsubscribe) sendersWithListUnsub++;
+    }
+
     track("scan_completed", {
       scope,
       auto_mode: autoOn,
@@ -1168,8 +1435,48 @@ document.getElementById("btn-scan").addEventListener("click", async () => {
       bulk_inbox_via_feedback_id: bulkByCategory.feedback_id,
       bulk_inbox_via_precedence: bulkByCategory.precedence,
       bulk_inbox_via_auto_submitted: bulkByCategory.auto_submitted,
-      bulk_inbox_via_list_unsubscribe: bulkByCategory.list_unsubscribe_only
+      bulk_inbox_via_list_unsubscribe: bulkByCategory.list_unsubscribe_only,
+      // === Diagnostics par-sender (depuis senderTrace) ===
+      // Permettent de répondre "quelle proportion de mails non-bulk vient d'où ?"
+      senders_inspected:           senderTrace.size,
+      mails_inspected:             mailsInspected,
+      defender_calls_made:         defenderCallsMade,    // # mails envoyés en check Defender
+      body_scan_calls_made:        bodyScanCallsMade,    // # mails envoyés en body scan
+      outcome_grouped_header:      outcomeCounts.grouped_header,
+      outcome_grouped_body:        outcomeCounts.grouped_body,
+      outcome_grouped_no_method:   outcomeCounts.grouped_no_method,
+      outcome_rejected_defender:   outcomeCounts.rejected_defender,  // ← typiquement "le boss râle ici"
+      outcome_dropped_no_sender:   outcomeCounts.dropped_no_sender,
+      outcome_still_pending:       outcomeCounts.still_pending,      // doit être 0 — sinon bug pipeline
+      senders_with_bcl_seen:       sendersWithBcl,
+      senders_with_cat_seen:       sendersWithCat,
+      senders_with_list_unsub:     sendersWithListUnsub
     });
+
+    // Un event par domaine — granularité fine pour requêtes HogQL "quel sender est passé à travers".
+    // Domaine seulement (pas l'adresse) pour limiter la PII envoyée à PostHog.
+    for (const t of senderTrace.values()) {
+      track("sender_inspected", {
+        scope,
+        sender_domain:        t.domain,
+        mail_count:           t.mailCount,
+        folder_junk:          t.folders.has("junk"),
+        folder_inbox:         t.folders.has("inbox"),
+        bcl_min:              t.signals.bcl_min,
+        bcl_max:              t.signals.bcl_max,
+        cat:                  t.signals.cat,
+        has_list_unsubscribe: t.signals.has_list_unsubscribe,
+        has_list_id:          t.signals.has_list_id,
+        has_feedback_id:      t.signals.has_feedback_id,
+        has_precedence:       t.signals.has_precedence,
+        has_auto_submitted:   t.signals.has_auto_submitted,
+        classification:       t.classification,    // "bulk" | "not-bulk" | "no-sender" | "pending"
+        bulk_reason:          t.bulkReason,        // ex: "BCL:5", "CAT:BULK", "List-ID", "no-signal"
+        outcome:              t.outcome,           // ex: "grouped_header", "rejected_defender"
+        unsub_method:         t.unsubMethod
+      });
+    }
+    renderTraceTable();
 
     if (active.length === 0) {
       setStatus(`✅ Aucune newsletter trouvée dans les ${totalScanned} derniers emails.`);
@@ -1211,16 +1518,19 @@ document.getElementById("btn-load-more").addEventListener("click", async () => {
     // Affichage immédiat des nouveaux groupes header-based, puis enrichissement post body-scan
     renderResults();
     updateLoadMore();
+    renderTraceTable();
     if (needsDefenderCheck.length > 0) {
       setStatus(`🔍 Vérification Defender sur ${needsDefenderCheck.length} email(s)...`);
       await checkDefenderForCandidates(needsDefenderCheck, token);
       needsDefenderCheck = [];
+      renderTraceTable();
     }
     if (bodyScanCandidates.length > 0) {
       setStatus(`🔎 Analyse du corps de ${Math.min(bodyScanCandidates.length, 500)} email(s)...`);
       await scanBodiesForUnsubLinks(bodyScanCandidates, token);
       bodyScanCandidates = [];
       renderResults();
+      renderTraceTable();
     }
     setStatus("");
   } catch (err) {
