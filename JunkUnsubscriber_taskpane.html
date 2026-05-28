@@ -350,6 +350,39 @@ function track(event, props) {
   } catch (e) { /* ne jamais casser l'addin pour de la télémétrie */ }
 }
 
+// ============================================================
+// GLOBAL ERROR CAPTURE
+// ============================================================
+// Filet de sécurité pour intercepter les crashes JS spontanés (window error,
+// unhandled promise rejection) que les try/catch locaux ne couvrent pas.
+// Sans ce handler, un crash dans un click handler ou un setTimeout meurt
+// silencieusement → aucun event PostHog → impossible de diagnostiquer.
+// On les remonte en tant qu'event "js_error" avec stack/contexte tronqués.
+window.addEventListener("error", (e) => {
+  try {
+    track("js_error", {
+      stage:    "window_error",
+      message:  (e.error?.message || e.message || "(unknown)").substring(0, 200),
+      stack:    (e.error?.stack || "").substring(0, 500),
+      filename: (e.filename || "").substring(0, 200),
+      lineno:   e.lineno || null,
+      colno:    e.colno  || null
+    });
+    if (typeof dbg === "function") dbg(`💥 window.error: ${e.error?.message || e.message}`, "err");
+  } catch { /* never break the addin from the error handler */ }
+});
+window.addEventListener("unhandledrejection", (e) => {
+  try {
+    const reason = e.reason;
+    track("js_error", {
+      stage:   "unhandled_promise",
+      message: (reason?.message || (typeof reason === "string" ? reason : JSON.stringify(reason)) || "(unknown)").substring(0, 200),
+      stack:   (reason?.stack || "").substring(0, 500)
+    });
+    if (typeof dbg === "function") dbg(`💥 unhandled promise: ${reason?.message || reason}`, "err");
+  } catch { /* never break the addin from the error handler */ }
+});
+
 function identifyUser() {
   try {
     const email = Office?.context?.mailbox?.userProfile?.emailAddress;
@@ -2429,27 +2462,42 @@ document.getElementById("btn-unsub-bulk").addEventListener("click", async () => 
 // ============================================================
 document.getElementById("btn-delete-bulk").addEventListener("click", async () => {
   const btn = document.getElementById("btn-delete-bulk");
-  const checkedIdx = [...document.querySelectorAll(".group-checkbox:checked")].map(cb => parseInt(cb.dataset.idx));
-  if (checkedIdx.length === 0) { setStatus("Sélectionnez au moins un expéditeur."); return; }
-
-  btn.disabled = true;
   const originalLabel = btn.textContent;
-  btn.textContent = "⏳ Suppression...";
+  // Try/catch global sur tout le handler : sans ça, un crash hors deleteGroup
+  // (ex: sélecteur DOM qui retourne null, parseInt qui foire, race condition
+  // sur groups[]) meurt silencieusement → impossible à diagnostiquer.
+  try {
+    const checkedIdx = [...document.querySelectorAll(".group-checkbox:checked")].map(cb => parseInt(cb.dataset.idx));
+    if (checkedIdx.length === 0) { setStatus("Sélectionnez au moins un expéditeur."); return; }
 
-  let done = 0;
-  for (const idx of checkedIdx) {
-    const card = document.querySelector(`.group-item[data-idx="${idx}"]`);
-    const deleteBtn = card?.querySelector(".btn-sm.delete");
-    if (!card || !deleteBtn) continue;
-    await deleteGroup(idx, card, deleteBtn, true);
-    done++;
-    setStatus(`🗑️ Suppression... ${done}/${checkedIdx.length}`);
+    btn.disabled = true;
+    btn.textContent = "⏳ Suppression...";
+
+    let done = 0;
+    for (const idx of checkedIdx) {
+      const card = document.querySelector(`.group-item[data-idx="${idx}"]`);
+      const deleteBtn = card?.querySelector(".btn-sm.delete");
+      if (!card || !deleteBtn) continue;
+      await deleteGroup(idx, card, deleteBtn, true);
+      done++;
+      setStatus(`🗑️ Suppression... ${done}/${checkedIdx.length}`);
+    }
+
+    btn.disabled = false;
+    btn.textContent = originalLabel;
+    const folderName = deletedItemsFolder?.displayName || "la corbeille";
+    setStatus(`✅ ${done} expéditeur(s) déplacés vers "${folderName}" (l'affichage Outlook peut prendre 1 min à se rafraîchir).`);
+  } catch (err) {
+    dbg(`ERREUR DELETE BULK: ${err.message}`, "err");
+    setStatus(`❌ Erreur suppression : ${err.message}`);
+    btn.disabled = false;
+    btn.textContent = originalLabel;
+    track("error", {
+      stage:   "delete_bulk_handler",
+      message: (err.message || "(unknown)").substring(0, 200),
+      stack:   (err.stack || "").substring(0, 500)
+    });
   }
-
-  btn.disabled = false;
-  btn.textContent = originalLabel;
-  const folderName = deletedItemsFolder?.displayName || "la corbeille";
-  setStatus(`✅ ${done} expéditeur(s) déplacés vers "${folderName}" (l'affichage Outlook peut prendre 1 min à se rafraîchir).`);
 });
 
 // ============================================================
