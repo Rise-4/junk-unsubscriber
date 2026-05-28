@@ -693,13 +693,29 @@ function extractBulkSignals(headers) {
   return { isBulk: false, ...sig, reason };
 }
 
-// Helper : un mail est candidat pitch-check si CAT:SPM (SCL 5-6) ET en Junk.
-// On exclut l'Inbox volontairement : un SPM en Inbox = a leaké via safe-sender ou
-// règle user → c'est probablement un cold pitch légitime déjà whitelisté, on touche pas.
+// Helper : candidats à la "content scan" Phase 4 — mails en Junk où on a besoin
+// d'examiner le contenu pour trancher. Deux populations :
+//
+//   1. CAT:SPM (SCL 5-6) en Junk → potentiel cold pitch founder à sauver
+//   2. CAT:NONE en Junk → angle mort Defender (gateway tiers, petit ESP, etc.)
+//      Outlook a quand même routé en Junk → fort prior bulk, mais pas assez de
+//      signal pour décider direct. On regarde le body : s'il contient un lien
+//      unsubscribe → bulk avéré → dégager. Sinon insufficient evidence → laisser.
+//
+// On exclut l'Inbox volontairement : un SPM/NONE en Inbox = soit safe-sender,
+// soit règle user → c'est probablement un cold pitch légitime déjà whitelisté.
 function isPitchCheckCandidate(bulkSignals, folder) {
-  return folder === "junk"
-      && bulkSignals.cat === "SPM"
-      && (bulkSignals.scl === null || (bulkSignals.scl >= 5 && bulkSignals.scl <= 6));
+  if (folder !== "junk") return false;
+  // CAT:SPM avec SCL 5-6 (ou SCL non lu → on accepte par sécurité)
+  if (bulkSignals.cat === "SPM"
+      && (bulkSignals.scl === null || (bulkSignals.scl >= 5 && bulkSignals.scl <= 6))) {
+    return true;
+  }
+  // CAT:NONE en Junk : Defender muet mais Outlook a tranché → on creuse le body
+  if (!bulkSignals.cat || bulkSignals.cat === "NONE") {
+    return true;
+  }
+  return false;
 }
 
 // ============================================================
@@ -1055,12 +1071,15 @@ function processMessageIntoGroups(d, folder) {
     return;
   }
 
-  // NEW Cas 2bis : CAT:SPM en Junk (SCL 5-6) → pitch-check.
-  // Defender pense que c'est du spam mais incertain (SCL borderline). Beaucoup de cold pitches
-  // founders tombent ici (cold outreach + PDF deck = signature spam-like pour la ML). On va
-  // chercher dans le corps des signaux pitch concrets (mots-clés VC, plateformes deck, calendly).
-  // Si on en trouve → on sauve le mail. Si rien → on le traite comme bulk no-method.
-  // S'applique UNIQUEMENT au Junk : un SPM en Inbox = a leaké via safe-sender, on touche pas.
+  // NEW Cas 2bis : content scan Phase 4 — Junk avec CAT:SPM (SCL 5-6) OU CAT:NONE.
+  //   CAT:SPM : Defender pense que c'est du spam mais incertain. Cold pitches founders
+  //             tombent ici (cold outreach + PDF deck = signature spam-like).
+  //   CAT:NONE : Defender muet (gateway tiers, petit ESP, etc.) mais Outlook a routé en Junk.
+  // Dans les 2 cas on fetch le body et on cherche : signaux pitch (vocab/deck/calendly)
+  // ET lien unsubscribe. Verdict :
+  //   pitch trouvé → KEEP
+  //   unsub link trouvé → bulk + http-auto
+  //   ni l'un ni l'autre → SPM = bulk no-method, NONE = laissé (rejected_defender, no evidence)
   if (isPitchCheckCandidate(preBulk, folder)) {
     needsPitchCheck.push({ id: d.id, folder, senderEmail, sender, subject: d.subject });
     trace.classification = "pending"; // sera "bulk" ou "kept_pitch" après pitch-check
@@ -1280,8 +1299,8 @@ async function checkDefenderForCandidates(candidates, token) {
           const trace = senderTrace.get(groupingKey(entry.rep.senderEmail));
           if (trace) updateTraceSignals(trace, headers, bulk);
           if (!bulk.isBulk) {
-            // Sous-cas : CAT:SPM (SCL 5-6) en Junk → on bascule en pitch-check au lieu de rejeter direct.
-            // Pareil que processMessageIntoGroups : peut-être un cold pitch founder, on creuse le corps.
+            // Sous-cas : CAT:SPM ou CAT:NONE en Junk → bascule en content scan Phase 4.
+            // Phase 4 ira chercher pitch signals OU lien unsubscribe dans le body pour trancher.
             if (isPitchCheckCandidate(bulk, entry.rep.folder)) {
               needsPitchCheck.push({ ...entry.rep });
               for (const sib of entry.siblings) needsPitchCheck.push({ ...sib });
@@ -1360,9 +1379,11 @@ async function checkPitchForCandidates(candidates, token) {
   const batches = [];
   for (let i = 0; i < slice.length; i += BATCH) batches.push(slice.slice(i, i + BATCH));
 
-  let pitchKept = 0, noPitch = 0;
-  const pitchNames = [];   // pour debug
-  const noPitchNames = [];
+  let pitchKept = 0, noPitch = 0, bodyUnsubFound = 0, noEvidence = 0;
+  const pitchNames = [];     // pour debug : senders sauvés par pitch
+  const noPitchNames = [];   // pour debug : senders CAT:SPM dégagés (no pitch + no unsub)
+  const bodyUnsubNames = []; // pour debug : senders dégagés via lien unsub trouvé dans body
+  const noEvidenceNames = []; // pour debug : CAT:NONE no pitch no unsub → laissés (insufficient evidence)
 
   const labelOf = (entry) => entry.rep.sender || entry.rep.senderEmail || "?";
 
@@ -1432,14 +1453,57 @@ async function checkPitchForCandidates(candidates, token) {
             }
             if (pitchNames.length < 20) pitchNames.push(`${labelOf(entry)} [${pitch.signals.join(",")}]`);
           } else {
-            // ❌ Aucun signal pitch → traiter comme bulk no-method (sera supprimé en auto mode)
-            createNoMethodGroup(entry);
-            noPitch++;
-            if (trace) {
-              trace.classification = "bulk";
-              trace.outcome        = "grouped_spm_no_pitch";
+            // Pas de pitch → on cherche un lien unsubscribe dans le body (réutilise la regex Phase 3).
+            // Si trouvé : c'est du bulk avéré (un humain ne met pas de "unsubscribe" + lien),
+            // on a bonus une méthode http-auto pour désinscrire.
+            const unsubUrl = body ? extractBodyUnsubLink(body) : null;
+            if (unsubUrl) {
+              // ✅ Lien unsub trouvé → bulk + méthode http-auto (idem Phase 3)
+              const info = {
+                oneClickUrl: null, mailtoUrl: null, httpsUrl: unsubUrl,
+                displayLabel: "", method: "http-auto", source: "body"
+              };
+              try { info.displayLabel = new URL(unsubUrl).hostname; }
+              catch { info.displayLabel = unsubUrl.substring(0, 40); }
+
+              const g = findOrCreateGroup(entry.rep.senderEmail, info, entry.rep.sender);
+              g.folders.add(entry.rep.folder);
+              g.emails.push({ id: entry.rep.id, subject: entry.rep.subject || "(sans objet)", folder: entry.rep.folder });
+              for (const sib of entry.siblings) {
+                g.folders.add(sib.folder);
+                g.emails.push({ id: sib.id, subject: sib.subject || "(sans objet)", folder: sib.folder });
+              }
+              bodyUnsubFound++;
+              if (trace) {
+                trace.classification = "bulk";
+                trace.outcome        = "grouped_body";
+                trace.unsubMethod    = "http-auto";
+              }
+              if (bodyUnsubNames.length < 20) bodyUnsubNames.push(labelOf(entry));
+            } else {
+              // Pas de pitch, pas de lien unsub : décision selon CAT d'origine du mail.
+              //   CAT:SPM → assez de prior bulk (Defender + Junk routing) → grouped_spm_no_pitch (delete)
+              //   CAT:NONE → pas assez de signal (Defender muet) → laisser (rejected_defender)
+              //     même si en Junk, on n'ose pas dégager sans aucune preuve (risque humain mal routé).
+              const origCat = trace?.signals?.cat;
+              if (origCat === "SPM") {
+                createNoMethodGroup(entry);
+                noPitch++;
+                if (trace) {
+                  trace.classification = "bulk";
+                  trace.outcome        = "grouped_spm_no_pitch";
+                }
+                if (noPitchNames.length < 20) noPitchNames.push(labelOf(entry));
+              } else {
+                // CAT:NONE no pitch no unsub → laissé en Junk natif (Outlook s'en occupe)
+                noEvidence++;
+                if (trace) {
+                  trace.classification = "not-bulk";
+                  trace.outcome        = "rejected_defender";
+                }
+                if (noEvidenceNames.length < 15) noEvidenceNames.push(labelOf(entry));
+              }
             }
-            if (noPitchNames.length < 20) noPitchNames.push(labelOf(entry));
           }
         }
       } catch (err) {
@@ -1471,13 +1535,12 @@ async function checkPitchForCandidates(candidates, token) {
     }
   }
 
-  dbg(`Pitch check : ${pitchKept} sauvés (pitch détecté), ${noPitch} traités comme bulk (pas de signal pitch)`, pitchKept + noPitch > 0 ? "ok" : "info");
-  if (pitchNames.length > 0) {
-    dbg(`  ↳ sauvés : ${pitchNames.join(" | ")}${pitchKept > 20 ? ` (+${pitchKept - 20})` : ""}`, "info");
-  }
-  if (noPitchNames.length > 0) {
-    dbg(`  ↳ traités comme bulk : ${noPitchNames.join(", ")}${noPitch > 20 ? ` (+${noPitch - 20})` : ""}`, "info");
-  }
+  const total = pitchKept + bodyUnsubFound + noPitch + noEvidence;
+  dbg(`Content scan : ${pitchKept} pitch sauvés, ${bodyUnsubFound} bulk via lien body, ${noPitch} SPM dégagés (no method), ${noEvidence} CAT:NONE laissés (no evidence)`, total > 0 ? "ok" : "info");
+  if (pitchNames.length > 0)      dbg(`  ↳ pitch sauvés : ${pitchNames.join(" | ")}${pitchKept > 20 ? ` (+${pitchKept - 20})` : ""}`, "info");
+  if (bodyUnsubNames.length > 0)  dbg(`  ↳ unsub body trouvé : ${bodyUnsubNames.join(", ")}${bodyUnsubFound > 20 ? ` (+${bodyUnsubFound - 20})` : ""}`, "info");
+  if (noPitchNames.length > 0)    dbg(`  ↳ SPM dégagés sans méthode : ${noPitchNames.join(", ")}${noPitch > 20 ? ` (+${noPitch - 20})` : ""}`, "info");
+  if (noEvidenceNames.length > 0) dbg(`  ↳ CAT:NONE laissés (insufficient evidence) : ${noEvidenceNames.join(", ")}${noEvidence > 15 ? ` (+${noEvidence - 15})` : ""}`, "info");
 }
 
 // ============================================================
