@@ -150,9 +150,9 @@
 </header>
 
 <div id="scope-bar">
-  <label><input type="radio" name="scope" value="both" checked/><span>Les deux</span></label>
+  <label><input type="radio" name="scope" value="both"/><span>Les deux</span></label>
   <label><input type="radio" name="scope" value="inbox"/><span>Boîte de réception</span></label>
-  <label><input type="radio" name="scope" value="junk"/><span>Indésirables</span></label>
+  <label><input type="radio" name="scope" value="junk" checked/><span>Indésirables</span></label>
 </div>
 
 <div id="auto-mode-bar" title="N'agit QUE sur le dossier Indésirables. Les emails de la Boîte de réception ne sont jamais touchés.">
@@ -654,11 +654,22 @@ function extractBulkSignals(headers) {
   if (bcl !== null && bcl >= 1) return { isBulk: true, ...sig, reason: `BCL:${bcl}` };
   if (cat === "BULK")           return { isBulk: true, ...sig, reason: `CAT:BULK` };
 
-  // NEW : CAT:HSPM (haute confiance spam, SCL≥7) ou SCL≥7 sans CAT → bulk direct.
-  // Defender est très confiant → pas de pitch-check, action directe.
-  // S'applique à Junk ET Inbox (un HSPM en Inbox = a leaké via règle, on peut le dégager).
-  if (cat === "HSPM" || (scl !== null && scl >= 7)) {
-    return { isBulk: true, ...sig, reason: `HSPM:SCL:${scl ?? '?'}` };
+  // CAT:HSPM / CAT:PHISH / SCL≥7 → bulk direct (haute confiance Defender, action immédiate).
+  // PHISH inclus parce que phishing = à dégager sans pitch-check (cf. faux positifs observés
+  // type sunriseglobalinvest.com qui restait en Junk sans cette règle).
+  // S'applique à Junk ET Inbox.
+  if (cat === "HSPM" || cat === "PHISH" || (scl !== null && scl >= 7)) {
+    return { isBulk: true, ...sig, reason: `${cat || `SCL:${scl}`}` };
+  }
+
+  // NEW : SFV ∈ {SKB, SKS, SKQ} → user/admin/Defender a déjà tranché contre ce sender.
+  //   SKB = Sender Blocklist (bloqué)
+  //   SKS = User Mark Spam (l'user a déjà tagué similaire en spam dans le passé)
+  //   SKQ = Quarantine release (passé par quarantaine)
+  // Bypass total : pas de pitch-check, traité comme bulk no-method.
+  // Évite les faux positifs du pitch-check sur du spam déjà identifié par OBR lui-même.
+  if (sfv === "SKB" || sfv === "SKS" || sfv === "SKQ") {
+    return { isBulk: true, ...sig, reason: `SFV:${sfv}` };
   }
 
   // --- Fallback : headers RFC standards (gateway tiers, Defender absent) ---
