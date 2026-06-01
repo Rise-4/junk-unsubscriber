@@ -131,6 +131,7 @@
     .trace-out-grouped_body          { color: #4ec9b0; }
     .trace-out-grouped_no_method     { color: #dcdcaa; }
     .trace-out-grouped_spm_no_pitch  { color: #dcdcaa; }
+    .trace-out-grouped_structural    { color: #dcdcaa; font-weight: 600; }
     .trace-out-kept_pitch            { color: #c586c0; font-weight: 600; } /* highlight pitch sauvé */
     .trace-out-pitch_pending         { color: #c586c0; opacity: 0.7; }
     .trace-out-defender_pending      { color: #9cdcfe; opacity: 0.7; }
@@ -260,7 +261,7 @@ function renderTraceTable() {
   // puis bulk OK, puis pitchs sauvés (qu'on veut voir d'un coup d'œil aussi)
   const order = {
     still_pending: 0, dropped_no_sender: 1, defender_pending: 2, pitch_pending: 3,
-    rejected_defender: 4, grouped_no_method: 5, grouped_spm_no_pitch: 6,
+    rejected_defender: 4, grouped_no_method: 5, grouped_spm_no_pitch: 6, grouped_structural: 6,
     kept_pitch: 7, grouped_body: 8, grouped_header: 9
   };
   allEntries.sort((a, b) => (order[a.outcome] ?? 99) - (order[b.outcome] ?? 99) || b.mailCount - a.mailCount);
@@ -424,10 +425,17 @@ const HEADER_NAMES = [
   "list-unsubscribe", "list-unsubscribe-post",
   "x-microsoft-antispam", "x-forefront-antispam-report",
   "list-id", "feedback-id", "precedence", "auto-submitted",
-  // NEW : auth pour confirmer la légitimité du sender (SPF/DKIM/DMARC pass/fail)
-  // utilisé en débug + comme signal additionnel sur les pitchs (fail = + suspect)
-  "authentication-results"
+  "authentication-results",
+  // NEW : signaux bulk additionnels qu'on ne capturait pas (cf. arp242.net + SpamAssassin)
+  //   x-msfbl = header Microsoft posé UNIQUEMENT sur les mails auto-générés (FBL)
+  //   x-mailer = identifie l'ESP (Mailchimp/SendGrid/Mailgun/...) → newsletter à 99% si match
+  "x-msfbl", "x-mailer"
 ];
+
+// Liste d'ESP / Email Service Providers connus, qu'on détecte via X-Mailer.
+// Si X-Mailer matche un de ces patterns → mail = newsletter à coup quasi-sûr.
+// Source : écosystème ESP standard 2026.
+const ESP_MAILER_RE = /mailchimp|sendgrid|mailgun|amazon\s*ses|hubspot|sendinblue|brevo|convertkit|klaviyo|postmark|sparkpost|mailerlite|activecampaign|getresponse|aweber|drip|emarsys|salesforce|marketo|pardot|customer\.io|braze|iterable|mandrill|elastic\s*email|substack|beehiiv|revue|gohighlevel|ghost\.org|netcore|cleverreach|sendlane|moosend|mailjet|campaignmonitor|constant\s*contact|smtp2go|moosend/i;
 const LU_FILTER  = HEADER_NAMES.map(n => `id eq 'String ${HEADER_NS} Name ${n}'`).join(" or ");
 const LU_EXPAND  = `singleValueExtendedProperties($filter=${encodeURIComponent(LU_FILTER)})`;
 const MSG_SELECT = "id,subject,from";
@@ -695,12 +703,9 @@ function extractBulkSignals(headers) {
     return { isBulk: true, ...sig, reason: `${cat || `SCL:${scl}`}` };
   }
 
-  // NEW : SFV ∈ {SKB, SKS, SKQ} → user/admin/Defender a déjà tranché contre ce sender.
-  //   SKB = Sender Blocklist (bloqué)
-  //   SKS = User Mark Spam (l'user a déjà tagué similaire en spam dans le passé)
-  //   SKQ = Quarantine release (passé par quarantaine)
+  // SFV ∈ {SKB, SKS, SKQ} → user/admin/Defender a déjà tranché contre ce sender.
+  //   SKB = Sender Blocklist | SKS = User Mark Spam | SKQ = Quarantine release
   // Bypass total : pas de pitch-check, traité comme bulk no-method.
-  // Évite les faux positifs du pitch-check sur du spam déjà identifié par OBR lui-même.
   if (sfv === "SKB" || sfv === "SKS" || sfv === "SKQ") {
     return { isBulk: true, ...sig, reason: `SFV:${sfv}` };
   }
@@ -712,6 +717,18 @@ function extractBulkSignals(headers) {
   if (prec && /^(bulk|list|junk)\b/i.test(prec.value)) return { isBulk: true, ...sig, reason: `Precedence:${prec.value.trim()}` };
   const autoSub = byName("auto-submitted");
   if (autoSub && /^(auto-generated|auto-replied)\b/i.test(autoSub.value)) return { isBulk: true, ...sig, reason: `Auto-Submitted:${autoSub.value.trim()}` };
+
+  // --- NEW : X-MSFBL (Microsoft Feedback Loop) — posé UNIQUEMENT sur les mails auto-générés ---
+  // Source : arp242.net + SparkPost FBL docs. Signal binaire, quasi-aucun faux positif.
+  if (byName("x-msfbl")) return { isBulk: true, ...sig, reason: "X-MSFBL" };
+
+  // --- NEW : X-Mailer matche un ESP connu (Mailchimp, SendGrid, Mailgun, etc.) ---
+  // Newsletter à 99% si match. Capture les ESP qui n'ont pas posé BCL≥1 (petit volume).
+  const xMailer = byName("x-mailer");
+  if (xMailer && xMailer.value && ESP_MAILER_RE.test(xMailer.value)) {
+    const m = xMailer.value.match(ESP_MAILER_RE);
+    return { isBulk: true, ...sig, reason: `X-Mailer:${(m?.[0] || "ESP").toLowerCase().trim()}` };
+  }
 
   // --- Filet ultime : présence d'un List-Unsubscribe sans BCL (rare mais possible) ---
   // Un humain ne pose jamais ce header → présence = bulk même si Defender muet.
@@ -726,27 +743,40 @@ function extractBulkSignals(headers) {
   return { isBulk: false, ...sig, reason };
 }
 
-// Helper : candidats à la "content scan" Phase 4 — mails en Junk où on a besoin
-// d'examiner le contenu pour trancher. Deux populations :
+// Helper : candidats à la "content scan" Phase 4 — mails où on a besoin
+// d'examiner le contenu pour trancher. Trois populations :
 //
 //   1. CAT:SPM (SCL 5-6) en Junk → potentiel cold pitch founder à sauver
-//   2. CAT:NONE en Junk → angle mort Defender (gateway tiers, petit ESP, etc.)
-//      Outlook a quand même routé en Junk → fort prior bulk, mais pas assez de
-//      signal pour décider direct. On regarde le body : s'il contient un lien
-//      unsubscribe → bulk avéré → dégager. Sinon insufficient evidence → laisser.
+//   2. CAT:NONE en Junk → angle mort Defender (gateway tiers, petit ESP)
+//      Outlook a quand même routé en Junk → fort prior bulk
+//   3. INBOX sans signal bulk + sender préfixe "robot" (noreply@, welcome@, etc.)
+//      → angle mort historique (cas climbfinder) — newsletter qui n'arrive jamais
+//      dans le Junk parce que Defender ne la voit pas, mais qui est clairement
+//      automatisée. On creuse le body avec extractStructuralScore pour décider.
 //
-// On exclut l'Inbox volontairement : un SPM/NONE en Inbox = soit safe-sender,
-// soit règle user → c'est probablement un cold pitch légitime déjà whitelisté.
-function isPitchCheckCandidate(bulkSignals, folder) {
-  if (folder !== "junk") return false;
-  // CAT:SPM avec SCL 5-6 (ou SCL non lu → on accepte par sécurité)
-  if (bulkSignals.cat === "SPM"
-      && (bulkSignals.scl === null || (bulkSignals.scl >= 5 && bulkSignals.scl <= 6))) {
-    return true;
+// Note : on EXCLUT toujours les Inbox sans préfixe robot pour éviter de body-fetch
+// massivement tous les humains (coût Graph + risque faux positif).
+function isPitchCheckCandidate(bulkSignals, folder, senderEmail) {
+  // Cas Junk (existant) — pitch-check + body unsub fallback
+  if (folder === "junk") {
+    // CAT:SPM avec SCL 5-6 (ou SCL non lu → on accepte par sécurité)
+    if (bulkSignals.cat === "SPM"
+        && (bulkSignals.scl === null || (bulkSignals.scl >= 5 && bulkSignals.scl <= 6))) {
+      return true;
+    }
+    // CAT:NONE en Junk : Defender muet mais Outlook a tranché
+    if (!bulkSignals.cat || bulkSignals.cat === "NONE") {
+      return true;
+    }
+    return false;
   }
-  // CAT:NONE en Junk : Defender muet mais Outlook a tranché → on creuse le body
-  if (!bulkSignals.cat || bulkSignals.cat === "NONE") {
-    return true;
+  // NEW Cas Inbox — uniquement si sender préfixe robot ET pas de signal bulk
+  // (sinon déjà attrapé par la cascade Defender en amont).
+  if (folder === "inbox") {
+    const localPart = (senderEmail || "").split("@")[0] || "";
+    if (ROBOT_PREFIX_RE.test(localPart)) {
+      return true;
+    }
   }
   return false;
 }
@@ -819,6 +849,95 @@ function extractPitchSignals(body, attachments, subject) {
   if (frCount >= 1) signals.push(`vocab-fr:${frCount}`);
 
   return { hasPitch: signals.length > 0, signals };
+}
+
+// ============================================================
+// STRUCTURAL SCORING — newsletter detection sans signal Defender
+// ============================================================
+// Pour les mails Inbox sans aucun signal bulk (BCL:0, CAT:NONE, pas de List-*, etc.)
+// mais qui sont en fait des newsletters (ESP non conforme RFC 8058 / petit SaaS).
+// Exemple type : climbfinder.com (Monthly statistics) — Defender muet mais c'est
+// clairement automatisé.
+//
+// Approche : scoring multi-signaux fondé sur SpamAssassin (battle-tested 20 ans)
+// + littérature (arp242.net, prospeo). Seuil ≥ 50 → bulk.
+//
+// Tous les signaux sont indépendants et complémentaires : un humain n'en a
+// quasi aucun, une newsletter en cumule plusieurs.
+
+// Préfixes "robot" courants pour les expéditeurs newsletter / SaaS.
+// Si le mail vient d'une adresse avec ce préfixe + structure HTML newsletter
+// → c'est presque sûrement automatisé. Un humain n'écrit pas depuis ces préfixes.
+const ROBOT_PREFIX_RE = /^(no[-_]?reply|newsletter|news|welcome|info|hello|hi|team|notifications?|alerts?|updates?|contact|support|admin|automated|notif|do[-_]?not[-_]?reply|donotreply|mailer|hi-there|hey|community|service|account)/i;
+
+// Tracking pixel : image 1×1 / hidden / dimension 0 — signal très fort de bulk.
+// Couvre les patterns standards (img width="1" height="1", style="display:none", etc.)
+// Source : prospeo.io tracking-pixel guide + SpamAssassin.
+const TRACKING_PIXEL_RES = [
+  /<img[^>]*(?:width=["']?[01]["']?[^>]*height=["']?[01]["']?|height=["']?[01]["']?[^>]*width=["']?[01]["']?)[^>]*>/i,
+  /<img[^>]*style=["'][^"']*display\s*:\s*none[^"']*["'][^>]*>/i,
+  /<img[^>]*style=["'][^"']*(?:width|height)\s*:\s*0(?:px)?\s*[;"'][^>]*>/i
+];
+
+// Score structurel d'un mail. Renvoie { score, signals: [...] }.
+// Si score >= 50 → traité comme bulk (cf. SpamAssassin pondérations).
+// N'utilise QUE le body + senderEmail (les signaux header X-MSFBL/X-Mailer sont
+// déjà captés en amont par extractBulkSignals, pas besoin de les re-checker ici).
+function extractStructuralScore(body, senderEmail) {
+  const signals = [];
+  let score = 0;
+
+  // Récupère le HTML du body
+  const isHtml = body && body.contentType === "html";
+  const htmlContent = isHtml ? (body.content || "") : "";
+  const textContent = !isHtml ? (body?.content || "") : decodeHtmlEntities(htmlContent.replace(/<[^>]+>/g, " "));
+
+  // --- Sender préfixe robot (+15) ---
+  const localPart = (senderEmail || "").split("@")[0] || "";
+  if (ROBOT_PREFIX_RE.test(localPart)) {
+    signals.push("robot-prefix");
+    score += 15;
+  }
+
+  // --- Tracking pixel détecté (+35) — signal très fort ---
+  if (isHtml) {
+    for (const re of TRACKING_PIXEL_RES) {
+      if (re.test(htmlContent)) { signals.push("tracking-pixel"); score += 35; break; }
+    }
+  }
+
+  // --- "View in browser" / "Voir dans le navigateur" (+25) — un humain ne fait jamais ça ---
+  const viewInBrowserRe = /view\s+(?:this\s+)?(?:email\s+)?(?:in\s+(?:your\s+)?browser|online|on\s+the\s+web)|voir\s+(?:ce\s+(?:e?[-\s]?mail|message)\s+)?(?:dans\s+(?:votre\s+|le\s+)?navigateur|en\s+ligne)|afficher\s+(?:ce\s+(?:e?[-\s]?mail|message)\s+)?dans\s+(?:le\s+|votre\s+)?navigateur/i;
+  if (viewInBrowserRe.test(textContent) || viewInBrowserRe.test(htmlContent)) {
+    signals.push("view-in-browser");
+    score += 25;
+  }
+
+  // --- Footer copyright "© ... rights reserved" ou "tous droits réservés" (+20) ---
+  // Signal très spécifique aux newsletters et footers automatisés.
+  const copyrightRe = /(?:©|&copy;|copyright)\s*(?:\d{4}\s+)?[^.]*?(?:all\s+rights\s+reserved|rights\s+reserved|tous\s+droits\s+r[éeè]serv[ée]s)/i;
+  if (copyrightRe.test(textContent) || copyrightRe.test(htmlContent)) {
+    signals.push("copyright-footer");
+    score += 20;
+  }
+
+  // --- Structure newsletter : <table ... max-width:5-7XXpx> (+10) ---
+  // Pattern standard des templates ESP (Mailchimp, Klaviyo, etc.) pour rendu mobile.
+  if (isHtml && /<table[^>]*(?:style=["'][^"']*max[-\s]?width\s*:\s*[5-7]\d\dpx|width=["']?[5-7]\d\d["']?)/i.test(htmlContent)) {
+    signals.push("newsletter-table");
+    score += 10;
+  }
+
+  // --- Image-to-text ratio < 30% (texte très court par rapport au HTML) (+20) ---
+  // SpamAssassin HTML_IMAGE_RATIO_02 (score +2.2). Adapté : on compare longueur texte
+  // sans tags vs longueur HTML brut. Newsletter typique : beaucoup d'images, peu de texte.
+  if (isHtml && htmlContent.length > 500) {
+    const textLength = textContent.replace(/\s+/g, " ").trim().length;
+    const ratio = textLength / htmlContent.length;
+    if (ratio < 0.10) { signals.push("low-text-ratio"); score += 20; }
+  }
+
+  return { score, signals };
 }
 
 // ============================================================
@@ -951,7 +1070,9 @@ function getOrCreateTrace(senderEmail, sender, folder) {
       bulkReason: null,            // ex: "BCL:5", "CAT:BULK", "List-ID", "no-signal"
       outcome: "still_pending",    // voir enum ci-dessus
       unsubMethod: null,           // "one-click" | "graph-mailto" | "http-auto" | "popup" | null
-      pitchSignals: []             // ["pdf-deck", "pitch-platform", "vocab-en:3"] si scanné
+      pitchSignals: [],             // ["pdf-deck", "pitch-platform", "vocab-en:3"] si scanné
+      structuralScore: null,        // score SpamAssassin-style 0-150 si Phase 4 a tourné
+      structuralSignals: []         // ["tracking-pixel", "copyright-footer", "robot-prefix", ...]
     };
     senderTrace.set(key, t);
   }
@@ -1113,10 +1234,10 @@ function processMessageIntoGroups(d, folder) {
   //   pitch trouvé → KEEP
   //   unsub link trouvé → bulk + http-auto
   //   ni l'un ni l'autre → SPM = bulk no-method, NONE = laissé (rejected_defender, no evidence)
-  if (isPitchCheckCandidate(preBulk, folder)) {
+  if (isPitchCheckCandidate(preBulk, folder, senderEmail)) {
     needsPitchCheck.push({ id: d.id, folder, senderEmail, sender, subject: d.subject });
     trace.classification = "pending"; // sera "bulk" ou "kept_pitch" après pitch-check
-    trace.bulkReason     = preBulk.reason; // "CAT:SPM:SCL:5"
+    trace.bulkReason     = preBulk.reason; // ex "CAT:SPM:SCL:5" ou "BCL:0" pour Inbox robot
     trace.outcome        = "pitch_pending";
     return;
   }
@@ -1332,9 +1453,9 @@ async function checkDefenderForCandidates(candidates, token) {
           const trace = senderTrace.get(groupingKey(entry.rep.senderEmail));
           if (trace) updateTraceSignals(trace, headers, bulk);
           if (!bulk.isBulk) {
-            // Sous-cas : CAT:SPM ou CAT:NONE en Junk → bascule en content scan Phase 4.
-            // Phase 4 ira chercher pitch signals OU lien unsubscribe dans le body pour trancher.
-            if (isPitchCheckCandidate(bulk, entry.rep.folder)) {
+            // Sous-cas : CAT:SPM/NONE en Junk OU Inbox + sender préfixe robot → Phase 4.
+            // Phase 4 ira chercher pitch / lien unsubscribe / score structurel pour trancher.
+            if (isPitchCheckCandidate(bulk, entry.rep.folder, entry.rep.senderEmail)) {
               needsPitchCheck.push({ ...entry.rep });
               for (const sib of entry.siblings) needsPitchCheck.push({ ...sib });
               if (trace) {
@@ -1475,10 +1596,18 @@ async function checkPitchForCandidates(candidates, token) {
           }
 
           const pitch = extractPitchSignals(body, attachments, entry.rep.subject);
-          if (trace) trace.pitchSignals = pitch.signals;
+          // NEW : score structurel (tracking pixel, copyright, image ratio, etc.)
+          // Calculé pour TOUS les candidats — utilisé en tie-breaker quand
+          // pitch=false ET unsub link=false. Aussi tracé pour analyse PostHog.
+          const struct = extractStructuralScore(body, entry.rep.senderEmail);
+          if (trace) {
+            trace.pitchSignals      = pitch.signals;
+            trace.structuralScore   = struct.score;
+            trace.structuralSignals = struct.signals;
+          }
 
           if (pitch.hasPitch) {
-            // ✅ Pitch détecté → on sauve le mail. PAS de groupe créé → ni affiché ni supprimé.
+            // ✅ Pitch détecté → on sauve le mail (priorité absolue sur le scoring).
             pitchKept++;
             if (trace) {
               trace.classification = "kept_pitch";
@@ -1487,8 +1616,6 @@ async function checkPitchForCandidates(candidates, token) {
             if (pitchNames.length < 20) pitchNames.push(`${labelOf(entry)} [${pitch.signals.join(",")}]`);
           } else {
             // Pas de pitch → on cherche un lien unsubscribe dans le body (réutilise la regex Phase 3).
-            // Si trouvé : c'est du bulk avéré (un humain ne met pas de "unsubscribe" + lien),
-            // on a bonus une méthode http-auto pour désinscrire.
             const unsubUrl = body ? extractBodyUnsubLink(body) : null;
             if (unsubUrl) {
               // ✅ Lien unsub trouvé → bulk + méthode http-auto (idem Phase 3)
@@ -1513,11 +1640,22 @@ async function checkPitchForCandidates(candidates, token) {
                 trace.unsubMethod    = "http-auto";
               }
               if (bodyUnsubNames.length < 20) bodyUnsubNames.push(labelOf(entry));
+            } else if (struct.score >= 50) {
+              // ✅ NEW : score structurel ≥ 50 (tracking pixel + copyright footer + image ratio…)
+              //   → bulk no-method. Suppression seule, l'user n'a pas de méthode unsub mais on
+              //   l'a identifié comme newsletter avec haute confiance.
+              //   Cas type : climbfinder (welcome@ + tracking pixel + footer copyright = ~70).
+              createNoMethodGroup(entry);
+              noPitch++;
+              if (trace) {
+                trace.classification = "bulk";
+                trace.outcome        = "grouped_structural";
+              }
+              if (noPitchNames.length < 20) noPitchNames.push(`${labelOf(entry)} [struct:${struct.score}]`);
             } else {
-              // Pas de pitch, pas de lien unsub : décision selon CAT d'origine du mail.
-              //   CAT:SPM → assez de prior bulk (Defender + Junk routing) → grouped_spm_no_pitch (delete)
-              //   CAT:NONE → pas assez de signal (Defender muet) → laisser (rejected_defender)
-              //     même si en Junk, on n'ose pas dégager sans aucune preuve (risque humain mal routé).
+              // Pas de pitch, pas de lien unsub, score structurel < 50 : décision selon CAT.
+              //   CAT:SPM (Junk) → prior bulk déjà élevé → grouped_spm_no_pitch (delete)
+              //   CAT:NONE / Inbox → pas assez de signal → laisser (rejected_defender)
               const origCat = trace?.signals?.cat;
               if (origCat === "SPM") {
                 createNoMethodGroup(entry);
@@ -1528,13 +1666,13 @@ async function checkPitchForCandidates(candidates, token) {
                 }
                 if (noPitchNames.length < 20) noPitchNames.push(labelOf(entry));
               } else {
-                // CAT:NONE no pitch no unsub → laissé en Junk natif (Outlook s'en occupe)
+                // CAT:NONE / Inbox robot sans signal → laissé (insufficient evidence)
                 noEvidence++;
                 if (trace) {
                   trace.classification = "not-bulk";
                   trace.outcome        = "rejected_defender";
                 }
-                if (noEvidenceNames.length < 15) noEvidenceNames.push(labelOf(entry));
+                if (noEvidenceNames.length < 15) noEvidenceNames.push(`${labelOf(entry)} [struct:${struct.score}]`);
               }
             }
           }
@@ -1569,11 +1707,11 @@ async function checkPitchForCandidates(candidates, token) {
   }
 
   const total = pitchKept + bodyUnsubFound + noPitch + noEvidence;
-  dbg(`Content scan : ${pitchKept} pitch sauvés, ${bodyUnsubFound} bulk via lien body, ${noPitch} SPM dégagés (no method), ${noEvidence} CAT:NONE laissés (no evidence)`, total > 0 ? "ok" : "info");
+  dbg(`Content scan : ${pitchKept} pitch sauvés, ${bodyUnsubFound} bulk via lien body, ${noPitch} dégagés via score/SPM, ${noEvidence} laissés (no evidence)`, total > 0 ? "ok" : "info");
   if (pitchNames.length > 0)      dbg(`  ↳ pitch sauvés : ${pitchNames.join(" | ")}${pitchKept > 20 ? ` (+${pitchKept - 20})` : ""}`, "info");
   if (bodyUnsubNames.length > 0)  dbg(`  ↳ unsub body trouvé : ${bodyUnsubNames.join(", ")}${bodyUnsubFound > 20 ? ` (+${bodyUnsubFound - 20})` : ""}`, "info");
-  if (noPitchNames.length > 0)    dbg(`  ↳ SPM dégagés sans méthode : ${noPitchNames.join(", ")}${noPitch > 20 ? ` (+${noPitch - 20})` : ""}`, "info");
-  if (noEvidenceNames.length > 0) dbg(`  ↳ CAT:NONE laissés (insufficient evidence) : ${noEvidenceNames.join(", ")}${noEvidence > 15 ? ` (+${noEvidence - 15})` : ""}`, "info");
+  if (noPitchNames.length > 0)    dbg(`  ↳ dégagés (struct/SPM) : ${noPitchNames.join(", ")}${noPitch > 20 ? ` (+${noPitch - 20})` : ""}`, "info");
+  if (noEvidenceNames.length > 0) dbg(`  ↳ laissés (insufficient evidence) : ${noEvidenceNames.join(", ")}${noEvidence > 15 ? ` (+${noEvidence - 15})` : ""}`, "info");
 }
 
 // ============================================================
@@ -1878,7 +2016,7 @@ document.getElementById("btn-scan").addEventListener("click", async () => {
     // ("quel domaine a échappé, avec quels signaux ?") sans envoyer d'adresse complète.
     const outcomeCounts = {
       grouped_header: 0, grouped_body: 0, grouped_no_method: 0,
-      grouped_spm_no_pitch: 0, kept_pitch: 0,
+      grouped_spm_no_pitch: 0, grouped_structural: 0, kept_pitch: 0,
       rejected_defender: 0, dropped_no_sender: 0, still_pending: 0
     };
     let sendersWithBcl = 0, sendersWithScl = 0, sendersWithCat = 0, sendersWithListUnsub = 0;
@@ -1926,6 +2064,7 @@ document.getElementById("btn-scan").addEventListener("click", async () => {
       outcome_grouped_body:        outcomeCounts.grouped_body,
       outcome_grouped_no_method:   outcomeCounts.grouped_no_method,
       outcome_grouped_spm_no_pitch: outcomeCounts.grouped_spm_no_pitch, // SPM dégagé via pitch-check négatif
+      outcome_grouped_structural:  outcomeCounts.grouped_structural,    // NEW: dégagé via score structurel ≥ 50
       outcome_kept_pitch:          outcomeCounts.kept_pitch,             // pitch sauvé — à monitorer
       outcome_rejected_defender:   outcomeCounts.rejected_defender,
       outcome_dropped_no_sender:   outcomeCounts.dropped_no_sender,
@@ -1969,6 +2108,9 @@ document.getElementById("btn-scan").addEventListener("click", async () => {
         // Pitch detection (Phase 4)
         pitch_signals:        t.pitchSignals,                       // ["pdf-deck", "vocab-en:3", ...]
         pitch_kept:           t.outcome === "kept_pitch",           // bool : ce sender a-t-il été sauvé
+        // Structural scoring (NEW Phase 4 — SpamAssassin-style)
+        structural_score:     t.structuralScore,                    // 0-150 si Phase 4 a tourné, sinon null
+        structural_signals:   t.structuralSignals,                  // ["tracking-pixel", "copyright-footer", ...]
         // Verdict final
         classification:       t.classification,
         bulk_reason:          t.bulkReason,
