@@ -1596,18 +1596,82 @@ async function checkPitchForCandidates(candidates, token) {
           }
 
           const pitch = extractPitchSignals(body, attachments, entry.rep.subject);
-          // NEW : score structurel (tracking pixel, copyright, image ratio, etc.)
-          // Calculé pour TOUS les candidats — utilisé en tie-breaker quand
-          // pitch=false ET unsub link=false. Aussi tracé pour analyse PostHog.
           const struct = extractStructuralScore(body, entry.rep.senderEmail);
+          const unsubUrl = body ? extractBodyUnsubLink(body) : null;
           if (trace) {
             trace.pitchSignals      = pitch.signals;
             trace.structuralScore   = struct.score;
             trace.structuralSignals = struct.signals;
           }
 
-          if (pitch.hasPitch) {
-            // ✅ Pitch détecté → on sauve le mail (priorité absolue sur le scoring).
+          // BUG FIX 1 : si trace est DÉJÀ classified bulk (par Phase 1/3 — BCL≥1, List-*, etc.)
+          // → on ne touche PAS au verdict, peu importe le contenu. Avant ce fix, un mail
+          // 01net.com BCL:7 dont 1 mot vocab pitch était trouvé dans le body finissait kept_pitch
+          // alors que le verdict bulk de Phase 1 était écrasé par Phase 4. Régression critique.
+          if (trace && trace.classification === "bulk") {
+            // Déjà bulk → on ne re-classe pas. Le mail reste dans son groupe existant.
+            continue;
+          }
+
+          // BUG FIX 2 : distinguer pitch FORT (PDF deck, plateforme, calendly) de pitch FAIBLE
+          // (vocab seul). Avant ce fix, 1 mot vocab suffisait à protéger un mail avec score
+          // structurel = 65 (3 signaux newsletter). Cas Snorkel/01net/Sigparser/Teamtailor.
+          const STRONG_PITCH = new Set(["pdf-deck", "pitch-platform", "booking-link"]);
+          const hasStrongPitch = pitch.signals.some(s => STRONG_PITCH.has(s));
+
+          // Ordre de décision Phase 4 (du plus prioritaire au moins) :
+          //   1. Strong pitch (PDF deck / pitch platform / booking link) → KEEP toujours
+          //      (vrai signal cold pitch founder, même si template ESP)
+          //   2. Lien unsub trouvé dans body → BULK + méthode http-auto
+          //   3. Score structurel ≥ 50 → BULK no-method (signaux newsletter forts)
+          //      → cas type Snorkel, climbfinder (tracking pixel + footer copyright + ratio)
+          //   4. Pitch FAIBLE (vocab seul) sans struct fort → KEEP (prudence)
+          //   5. CAT:SPM fallback → bulk no-method
+          //   6. Else → rejected (insufficient evidence)
+          if (hasStrongPitch) {
+            // ✅ Strong pitch → KEEP (PDF deck, DocSend, Calendly = vrai pitch)
+            pitchKept++;
+            if (trace) {
+              trace.classification = "kept_pitch";
+              trace.outcome        = "kept_pitch";
+            }
+            if (pitchNames.length < 20) pitchNames.push(`${labelOf(entry)} [${pitch.signals.join(",")}]`);
+          } else if (unsubUrl) {
+            // ✅ Lien unsub trouvé → bulk + méthode http-auto
+            const info = {
+              oneClickUrl: null, mailtoUrl: null, httpsUrl: unsubUrl,
+              displayLabel: "", method: "http-auto", source: "body"
+            };
+            try { info.displayLabel = new URL(unsubUrl).hostname; }
+            catch { info.displayLabel = unsubUrl.substring(0, 40); }
+
+            const g = findOrCreateGroup(entry.rep.senderEmail, info, entry.rep.sender);
+            g.folders.add(entry.rep.folder);
+            g.emails.push({ id: entry.rep.id, subject: entry.rep.subject || "(sans objet)", folder: entry.rep.folder });
+            for (const sib of entry.siblings) {
+              g.folders.add(sib.folder);
+              g.emails.push({ id: sib.id, subject: sib.subject || "(sans objet)", folder: sib.folder });
+            }
+            bodyUnsubFound++;
+            if (trace) {
+              trace.classification = "bulk";
+              trace.outcome        = "grouped_body";
+              trace.unsubMethod    = "http-auto";
+            }
+            if (bodyUnsubNames.length < 20) bodyUnsubNames.push(labelOf(entry));
+          } else if (struct.score >= 50) {
+            // ✅ Score structurel ≥ 50 → BULK même si pitch faible (vocab seul).
+            // Fix Bug 2 : prime sur "pitch.hasPitch" si pitch est seulement vocab.
+            createNoMethodGroup(entry);
+            noPitch++;
+            if (trace) {
+              trace.classification = "bulk";
+              trace.outcome        = "grouped_structural";
+            }
+            if (noPitchNames.length < 20) noPitchNames.push(`${labelOf(entry)} [struct:${struct.score}]`);
+          } else if (pitch.hasPitch) {
+            // Pitch faible (vocab seul) ET pas de structure newsletter forte → KEEP par prudence.
+            // Probable cold pitch founder qui n'utilise pas de template ESP.
             pitchKept++;
             if (trace) {
               trace.classification = "kept_pitch";
@@ -1615,65 +1679,24 @@ async function checkPitchForCandidates(candidates, token) {
             }
             if (pitchNames.length < 20) pitchNames.push(`${labelOf(entry)} [${pitch.signals.join(",")}]`);
           } else {
-            // Pas de pitch → on cherche un lien unsubscribe dans le body (réutilise la regex Phase 3).
-            const unsubUrl = body ? extractBodyUnsubLink(body) : null;
-            if (unsubUrl) {
-              // ✅ Lien unsub trouvé → bulk + méthode http-auto (idem Phase 3)
-              const info = {
-                oneClickUrl: null, mailtoUrl: null, httpsUrl: unsubUrl,
-                displayLabel: "", method: "http-auto", source: "body"
-              };
-              try { info.displayLabel = new URL(unsubUrl).hostname; }
-              catch { info.displayLabel = unsubUrl.substring(0, 40); }
-
-              const g = findOrCreateGroup(entry.rep.senderEmail, info, entry.rep.sender);
-              g.folders.add(entry.rep.folder);
-              g.emails.push({ id: entry.rep.id, subject: entry.rep.subject || "(sans objet)", folder: entry.rep.folder });
-              for (const sib of entry.siblings) {
-                g.folders.add(sib.folder);
-                g.emails.push({ id: sib.id, subject: sib.subject || "(sans objet)", folder: sib.folder });
-              }
-              bodyUnsubFound++;
-              if (trace) {
-                trace.classification = "bulk";
-                trace.outcome        = "grouped_body";
-                trace.unsubMethod    = "http-auto";
-              }
-              if (bodyUnsubNames.length < 20) bodyUnsubNames.push(labelOf(entry));
-            } else if (struct.score >= 50) {
-              // ✅ NEW : score structurel ≥ 50 (tracking pixel + copyright footer + image ratio…)
-              //   → bulk no-method. Suppression seule, l'user n'a pas de méthode unsub mais on
-              //   l'a identifié comme newsletter avec haute confiance.
-              //   Cas type : climbfinder (welcome@ + tracking pixel + footer copyright = ~70).
+            // Pas de pitch, pas de lien unsub, struct < 50 : décision selon CAT.
+            const origCat = trace?.signals?.cat;
+            if (origCat === "SPM") {
               createNoMethodGroup(entry);
               noPitch++;
               if (trace) {
                 trace.classification = "bulk";
-                trace.outcome        = "grouped_structural";
+                trace.outcome        = "grouped_spm_no_pitch";
               }
-              if (noPitchNames.length < 20) noPitchNames.push(`${labelOf(entry)} [struct:${struct.score}]`);
+              if (noPitchNames.length < 20) noPitchNames.push(labelOf(entry));
             } else {
-              // Pas de pitch, pas de lien unsub, score structurel < 50 : décision selon CAT.
-              //   CAT:SPM (Junk) → prior bulk déjà élevé → grouped_spm_no_pitch (delete)
-              //   CAT:NONE / Inbox → pas assez de signal → laisser (rejected_defender)
-              const origCat = trace?.signals?.cat;
-              if (origCat === "SPM") {
-                createNoMethodGroup(entry);
-                noPitch++;
-                if (trace) {
-                  trace.classification = "bulk";
-                  trace.outcome        = "grouped_spm_no_pitch";
-                }
-                if (noPitchNames.length < 20) noPitchNames.push(labelOf(entry));
-              } else {
-                // CAT:NONE / Inbox robot sans signal → laissé (insufficient evidence)
-                noEvidence++;
-                if (trace) {
-                  trace.classification = "not-bulk";
-                  trace.outcome        = "rejected_defender";
-                }
-                if (noEvidenceNames.length < 15) noEvidenceNames.push(`${labelOf(entry)} [struct:${struct.score}]`);
+              // CAT:NONE / Inbox sans signal → laissé (insufficient evidence)
+              noEvidence++;
+              if (trace) {
+                trace.classification = "not-bulk";
+                trace.outcome        = "rejected_defender";
               }
+              if (noEvidenceNames.length < 15) noEvidenceNames.push(`${labelOf(entry)} [struct:${struct.score}]`);
             }
           }
         }
