@@ -1668,16 +1668,29 @@ async function runAutoMode(token) {
       try {
         const resp = await callGraph("https://graph.microsoft.com/v1.0/$batch", "POST", { requests }, token);
         for (const r of (resp.responses || [])) {
-          // 201 Created (move) = succès. 200 sur certains tenants. On vérifie parentFolderId
-          // si le body est présent pour confirmation forte.
-          if ((r.status === 201 || r.status === 200) && r.body) {
-            const entry = chunk[parseInt(r.id)];
-            if (entry && (!r.body.parentFolderId || r.body.parentFolderId === trash.id)) {
+          const entry = chunk[parseInt(r.id)];
+          // Accepte tout 2xx : Graph /move peut renvoyer 200, 201 OU 204 selon le tenant
+          // (et même 200 sans body sur certaines configs). Le critère "&& r.body" précédent
+          // ratait silencieusement les succès sans corps → mails déplacés côté serveur mais
+          // non comptés côté UI → OBR voyait "37 mails restants" alors qu'ils étaient déjà
+          // dans la corbeille. On accepte le status comme source de vérité, et on vérifie
+          // parentFolderId seulement quand le body est présent (confirmation forte facultative).
+          if (entry && r.status >= 200 && r.status < 300) {
+            if (!r.body || !r.body.parentFolderId || r.body.parentFolderId === trash.id) {
               deletedIds.add(entry.email.id);
+            } else {
+              dbg(`Auto batch delete : ${entry.email.id.substring(0,12)}… ${r.status} OK mais parentFolderId mismatch (${r.body.parentFolderId?.substring(0,24) || "?"})`, "warn");
             }
+          } else if (entry) {
+            // Log les statuts ≥ 400 pour debug. Sans ça les échecs étaient silencieux.
+            const errMsg = r.body?.error?.message || r.body?.error?.code || "(no detail)";
+            dbg(`Auto batch delete FAIL ${r.status} : ${entry.email.id.substring(0,12)}… — ${errMsg}`, "err");
           }
         }
-      } catch (e) { dbg(`Auto batch delete: ${e.message}`, "warn"); }
+      } catch (e) {
+        dbg(`Auto batch delete (network/throw): ${e.message}`, "err");
+        track("error", { stage: "auto_delete_batch", message: (e.message || "").substring(0, 200) });
+      }
     }));
   }
 
