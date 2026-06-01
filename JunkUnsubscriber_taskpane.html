@@ -1811,49 +1811,91 @@ async function runAutoMode(token) {
 
   setStatus(`⚡ Auto : ${unsubOk}/${targets.length} désinscrits · suppression de ${junkEmails.length} email(s)...`);
 
-  const BATCH = 20, CONCURRENCY = 3;
+  // Throttling Microsoft Graph : sur certains tenants (Mantu observé fin mai 2026)
+  // /move déclenche du 429 par sub-response au-delà de ~12 moves/seconde par mailbox.
+  // callGraph retry le $batch extérieur mais PAS les sub-responses 429 internes —
+  // elles tombaient silencieusement avant. On gère ça en deux temps :
+  //  1. CONCURRENCY=1 par défaut (60 moves parallèles trop pour tenants stricts)
+  //  2. Retry des sub-responses 429/503/5xx avec Retry-After (RFC 7231 §7.1.3)
+  const BATCH = 20, CONCURRENCY = 1, MAX_SUB_RETRIES = 3;
   const deletedIds = new Set();
+  const statusCounts = {}; // pour télémétrie : distribution des status finaux
   const allBatches = [];
   for (let i = 0; i < junkEmails.length; i += BATCH) allBatches.push(junkEmails.slice(i, i + BATCH));
 
+  // Une vague = un ou plusieurs batches de 20 traités en parallèle.
+  // À l'intérieur d'un batch, on retry individuellement les sub-responses 429/5xx.
+  async function processBatch(chunk, retryAttempt = 0) {
+    const requests = chunk.map((entry, idx) => ({
+      id: String(idx),
+      method: "POST",
+      url: `/me/messages/${entry.email.id}/move`,
+      body: { destinationId: trash.id },
+      headers: { "Content-Type": "application/json" }
+    }));
+    let resp;
+    try {
+      resp = await callGraph("https://graph.microsoft.com/v1.0/$batch", "POST", { requests }, token);
+    } catch (e) {
+      dbg(`Auto batch delete (network/throw): ${e.message}`, "err");
+      track("error", { stage: "auto_delete_batch", message: (e.message || "").substring(0, 200) });
+      return;
+    }
+
+    const toRetry = []; // entries à retenter (429/503 sub-responses)
+    let maxRetryAfterSec = 0;
+
+    for (const r of (resp.responses || [])) {
+      const entry = chunk[parseInt(r.id)];
+      if (!entry) continue;
+      const status = r.status;
+      statusCounts[status] = (statusCounts[status] || 0) + 1;
+
+      // Succès : tout 2xx — Graph /move renvoie 200, 201 ou 204 selon le tenant.
+      // Si body présent on confirme avec parentFolderId, sinon on fait confiance au status.
+      if (status >= 200 && status < 300) {
+        if (!r.body || !r.body.parentFolderId || r.body.parentFolderId === trash.id) {
+          deletedIds.add(entry.email.id);
+        } else {
+          dbg(`Auto delete : ${entry.email.id.substring(0,12)}… ${status} OK mais parentFolderId mismatch (${r.body.parentFolderId?.substring(0,24) || "?"})`, "warn");
+        }
+        continue;
+      }
+
+      // Throttling : 429 (Too Many Requests) ou 503 (Service Unavailable) → retry.
+      // Microsoft Graph honore Retry-After ; on le lit dans r.headers si présent.
+      if ((status === 429 || status === 503) && retryAttempt < MAX_SUB_RETRIES) {
+        const ra = parseInt(r.headers?.["Retry-After"] || r.headers?.["retry-after"] || "0", 10);
+        if (ra > maxRetryAfterSec) maxRetryAfterSec = ra;
+        toRetry.push(entry);
+        continue;
+      }
+
+      // Échec définitif : log + on passe au suivant (sera visible au prochain scan).
+      const errMsg = r.body?.error?.message || r.body?.error?.code || "(no detail)";
+      dbg(`Auto delete FAIL ${status} : ${entry.email.id.substring(0,12)}… — ${errMsg}`, "err");
+    }
+
+    // Retry du sous-batch des 429/503. Backoff = max(Retry-After, exponentiel sur tentative).
+    if (toRetry.length > 0) {
+      const waitMs = Math.max(maxRetryAfterSec * 1000, 1000 * Math.pow(2, retryAttempt));
+      dbg(`Auto delete : ${toRetry.length} sub-response(s) en 429/503, retry dans ${waitMs}ms (tentative ${retryAttempt + 1}/${MAX_SUB_RETRIES})`, "warn");
+      await new Promise(r => setTimeout(r, waitMs));
+      await processBatch(toRetry, retryAttempt + 1);
+    }
+  }
+
   for (let i = 0; i < allBatches.length; i += CONCURRENCY) {
     const wave = allBatches.slice(i, i + CONCURRENCY);
-    await Promise.all(wave.map(async chunk => {
-      const requests = chunk.map((entry, idx) => ({
-        id: String(idx),
-        method: "POST",
-        url: `/me/messages/${entry.email.id}/move`,
-        body: { destinationId: trash.id },
-        headers: { "Content-Type": "application/json" }
-      }));
-      try {
-        const resp = await callGraph("https://graph.microsoft.com/v1.0/$batch", "POST", { requests }, token);
-        for (const r of (resp.responses || [])) {
-          const entry = chunk[parseInt(r.id)];
-          // Accepte tout 2xx : Graph /move peut renvoyer 200, 201 OU 204 selon le tenant
-          // (et même 200 sans body sur certaines configs). Le critère "&& r.body" précédent
-          // ratait silencieusement les succès sans corps → mails déplacés côté serveur mais
-          // non comptés côté UI → OBR voyait "37 mails restants" alors qu'ils étaient déjà
-          // dans la corbeille. On accepte le status comme source de vérité, et on vérifie
-          // parentFolderId seulement quand le body est présent (confirmation forte facultative).
-          if (entry && r.status >= 200 && r.status < 300) {
-            if (!r.body || !r.body.parentFolderId || r.body.parentFolderId === trash.id) {
-              deletedIds.add(entry.email.id);
-            } else {
-              dbg(`Auto batch delete : ${entry.email.id.substring(0,12)}… ${r.status} OK mais parentFolderId mismatch (${r.body.parentFolderId?.substring(0,24) || "?"})`, "warn");
-            }
-          } else if (entry) {
-            // Log les statuts ≥ 400 pour debug. Sans ça les échecs étaient silencieux.
-            const errMsg = r.body?.error?.message || r.body?.error?.code || "(no detail)";
-            dbg(`Auto batch delete FAIL ${r.status} : ${entry.email.id.substring(0,12)}… — ${errMsg}`, "err");
-          }
-        }
-      } catch (e) {
-        dbg(`Auto batch delete (network/throw): ${e.message}`, "err");
-        track("error", { stage: "auto_delete_batch", message: (e.message || "").substring(0, 200) });
-      }
-    }));
+    await Promise.all(wave.map(chunk => processBatch(chunk)));
   }
+
+  // Distribution des status finaux dans les logs (utile pour confirmer/infirmer le throttling).
+  const statusSummary = Object.entries(statusCounts)
+    .sort(([a], [b]) => parseInt(a) - parseInt(b))
+    .map(([s, n]) => `${s}:${n}`)
+    .join(", ");
+  if (statusSummary) dbg(`Auto delete status distribution : ${statusSummary}`, "info");
 
   // === Phase 3 : update state & re-render ===
   // Groupe entièrement vidé (folders={junk}) → on retire du tableau.
@@ -1882,6 +1924,16 @@ async function runAutoMode(token) {
   if (failedDelete > 0) msg += ` · ${failedDelete} suppression(s) en échec`;
   setStatus(msg);
   dbg(`Auto terminé : ${unsubOk}/${targets.length} unsub, ${deletedIds.size}/${junkEmails.length} delete`, "ok");
+  // Agrégat des status par classe pour analyse PostHog (compteurs uniquement, jamais d'ID).
+  // delete_throttled = 429 final après tous les retries. delete_4xx = autres erreurs client
+  // (404 si l'email a été déplacé entre-temps, 403 si plus de droits, etc.). delete_5xx = erreurs serveur.
+  let throttled = 0, errors4xx = 0, errors5xx = 0;
+  for (const [statusStr, n] of Object.entries(statusCounts)) {
+    const s = parseInt(statusStr, 10);
+    if (s === 429) throttled += n;
+    else if (s >= 400 && s < 500) errors4xx += n;
+    else if (s >= 500) errors5xx += n;
+  }
   track("auto_mode_run", {
     targets: targets.length,
     unsub_ok: unsubOk,
@@ -1889,6 +1941,9 @@ async function runAutoMode(token) {
     emails_targeted: junkEmails.length,
     emails_deleted: deletedIds.size,
     delete_failed: failedDelete,
+    delete_throttled: throttled,
+    delete_4xx: errors4xx,
+    delete_5xx: errors5xx,
     duration_ms: Date.now() - autoStartTs
   });
 }
