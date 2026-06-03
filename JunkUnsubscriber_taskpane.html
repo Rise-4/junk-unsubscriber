@@ -341,7 +341,7 @@ function renderTraceTable() {
 // Capture événements d'usage anonymisés : compteurs, durées, méthodes.
 // Aucun contenu d'email, expéditeur ou URL n'est envoyé. Identifiant = email Office,
 // tenant dérivé du domaine pour breakdown Rise / Mantu / DXC dans les dashboards.
-const APP_VERSION = "1.0.0.9";
+const APP_VERSION = "1.0.0.10";
 
 function track(event, props) {
   try {
@@ -537,6 +537,28 @@ async function getToken() {
 // ============================================================
 // GRAPH API
 // ============================================================
+// Wrapper fetch avec timeout via AbortController. Indispensable pour éviter les hangs
+// silencieux quand un serveur (Graph ou un host unsubscribe) ne répond jamais.
+// AbortError est mappé sur un Error("timeout") explicite pour que les callers puissent
+// le distinguer d'un échec réseau normal. clearTimeout DOIT être dans finally pour ne
+// pas fuiter le timer (un test laissant pendre clearTimeout cause des fuites + retry inconsistant).
+async function fetchWithTimeout(url, opts, timeoutMs) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...opts, signal: ctrl.signal });
+  } catch (e) {
+    if (e.name === "AbortError") {
+      const err = new Error(`timeout (${timeoutMs}ms)`);
+      err.name = "TimeoutError"; // permet à de futurs callers de tester e.name === "TimeoutError"
+      throw err;
+    }
+    throw e;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 async function callGraph(url, method, body, token, retries = 3) {
   dbg(`Graph ${method} ${url.substring(0, 90)}...`);
   const opts = {
@@ -544,17 +566,33 @@ async function callGraph(url, method, body, token, retries = 3) {
     headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json" }
   };
   if (body) opts.body = JSON.stringify(body);
-  const res = await fetch(url, opts);
 
-  // Throttling Graph : respecter Retry-After puis retenter
+  // Timeout 15s : Graph $batch peut prendre du temps mais 15s couvre 99% des cas.
+  // Un stall TCP au-delà → on retry (la retry queue ci-dessous le gère comme un 503).
+  let res;
+  try {
+    res = await fetchWithTimeout(url, opts, 15000);
+  } catch (e) {
+    if (retries > 0 && /timeout|network/i.test(e.message)) {
+      dbg(`Graph ${e.message} — retry (reste ${retries - 1})`, "warn");
+      await new Promise(r => setTimeout(r, 1000));
+      return callGraph(url, method, body, token, retries - 1);
+    }
+    throw e;
+  }
+
+  // Throttling Graph : respecter Retry-After mais CAPÉ à 10s pour ne pas bloquer
+  // l'UI 5+ minutes si un serveur envoie un Retry-After absurde (vu en pratique
+  // chez des tenants overloaded qui renvoient 300/600/3600).
   if (res.status === 429 && retries > 0) {
-    const ra = parseInt(res.headers.get("Retry-After") || "1", 10);
-    dbg(`Graph 429 — retry dans ${ra}s (reste ${retries - 1})`, "warn");
+    const raRaw = parseInt(res.headers.get("Retry-After") || "1", 10);
+    const ra = Math.min(Math.max(raRaw, 1), 10); // 1s min, 10s max
+    dbg(`Graph 429 — retry dans ${ra}s (Retry-After=${raRaw}, capé à ${ra} ; reste ${retries - 1})`, "warn");
     await new Promise(r => setTimeout(r, ra * 1000));
     return callGraph(url, method, body, token, retries - 1);
   }
-  // Erreurs transientes : 503, 504 → retry avec backoff exponentiel
-  if ((res.status === 503 || res.status === 504) && retries > 0) {
+  // Erreurs transientes : 502, 503, 504 → retry avec backoff exponentiel
+  if ((res.status === 502 || res.status === 503 || res.status === 504) && retries > 0) {
     const wait = (4 - retries) * 1000;
     dbg(`Graph ${res.status} — retry dans ${wait}ms`, "warn");
     await new Promise(r => setTimeout(r, wait));
@@ -1766,186 +1804,280 @@ async function checkPitchForCandidates(candidates, token) {
 //    → ~60 emails déplacés par seconde au lieu de 5/s en séquentiel.
 async function runAutoMode(token) {
   const autoStartTs = Date.now();
-  const targets = groups.filter(g => g && g.folders.has("junk"));
-  if (targets.length === 0) {
-    setStatus(`✅ Aucun expéditeur indésirable à traiter automatiquement.`);
-    track("auto_mode_run", { targets: 0, unsub_ok: 0, emails_targeted: 0, emails_deleted: 0, duration_ms: Date.now() - autoStartTs });
-    return;
-  }
 
-  setStatus(`⚡ Mode auto : désinscription de ${targets.length} expéditeur(s)...`);
-  dbg(`Auto mode : ${targets.length} groupes ciblés`);
-
-  // === Phase 1 : désinscriptions en parallèle ===
-  const unsubResults = await Promise.all(targets.map(async g => {
-    try {
-      if (g.info.method === "one-click" && g.info.oneClickUrl) {
-        return await postOneClickUnsubscribe(g.info.oneClickUrl);
-      }
-      if (g.info.method === "graph-mailto" && g.emails[0]?.id) {
-        await callGraph(
-          `https://graph.microsoft.com/beta/me/messages/${g.emails[0].id}/unsubscribe`,
-          "POST", null, token
-        );
-        return true;
-      }
-      if (g.info.method === "http-auto" && g.info.httpsUrl) {
-        return await silentGetUnsubscribe(g.info.httpsUrl);
-      }
-      // method "popup" : on skip l'unsub (pas automatisable) mais on supprime quand même
-      // — pour le boss, Junk = poubelle ; le mail ré-arrivera et sera retraité au prochain scan.
-      return false;
-    } catch (e) {
-      dbg(`Auto unsub ${g.sender}: ${e.message}`, "warn");
-      return false;
-    }
-  }));
-  const unsubOk = unsubResults.filter(Boolean).length;
-
-  // === Phase 2 : suppression des emails Junk via $batch ===
-  const trash = await getDeletedItemsFolder(token);
-  const junkEmails = [];
-  for (const g of targets) {
-    for (const e of g.emails) if (e.folder === "junk") junkEmails.push({ groupRef: g, email: e });
-  }
-
-  setStatus(`⚡ Auto : ${unsubOk}/${targets.length} désinscrits · suppression de ${junkEmails.length} email(s)...`);
-
-  // Throttling Microsoft Graph : sur certains tenants (Mantu observé fin mai 2026)
-  // /move déclenche du 429 par sub-response au-delà de ~12 moves/seconde par mailbox.
-  // callGraph retry le $batch extérieur mais PAS les sub-responses 429 internes —
-  // elles tombaient silencieusement avant. On gère ça en deux temps :
-  //  1. CONCURRENCY=1 par défaut (60 moves parallèles trop pour tenants stricts)
-  //  2. Retry des sub-responses 429/503/5xx avec Retry-After (RFC 7231 §7.1.3)
-  const BATCH = 20, CONCURRENCY = 1, MAX_SUB_RETRIES = 3;
+  // Variables qui doivent vivre HORS du try pour être accessibles dans le finally
+  // (sinon hang silencieux = aucun event PostHog = on n'a aucune visibilité).
+  let phaseReached = "start";
+  let errored = null;
+  let targets = [];
+  let unsubOk = 0, unsubFailed = 0;
+  const unsubFailReasons = { timeout: 0, throttled: 0, network: 0, no_method: 0, other: 0 };
+  let trash = null;
+  let junkEmails = [];
   const deletedIds = new Set();
-  const statusCounts = {}; // pour télémétrie : distribution des status finaux
-  const allBatches = [];
-  for (let i = 0; i < junkEmails.length; i += BATCH) allBatches.push(junkEmails.slice(i, i + BATCH));
+  const statusCounts = {}; // distribution status sub-response du batch delete
 
-  // Une vague = un ou plusieurs batches de 20 traités en parallèle.
-  // À l'intérieur d'un batch, on retry individuellement les sub-responses 429/5xx.
-  async function processBatch(chunk, retryAttempt = 0) {
-    const requests = chunk.map((entry, idx) => ({
-      id: String(idx),
-      method: "POST",
-      url: `/me/messages/${entry.email.id}/move`,
-      body: { destinationId: trash.id },
-      headers: { "Content-Type": "application/json" }
-    }));
-    let resp;
-    try {
-      resp = await callGraph("https://graph.microsoft.com/v1.0/$batch", "POST", { requests }, token);
-    } catch (e) {
-      dbg(`Auto batch delete (network/throw): ${e.message}`, "err");
-      track("error", { stage: "auto_delete_batch", message: (e.message || "").substring(0, 200) });
+  try {
+    targets = groups.filter(g => g && g.folders.has("junk"));
+    if (targets.length === 0) {
+      setStatus(`✅ Aucun expéditeur indésirable à traiter automatiquement.`);
+      phaseReached = "no_targets";
       return;
     }
 
-    const toRetry = []; // entries à retenter (429/503 sub-responses)
-    let maxRetryAfterSec = 0;
+    setStatus(`⚡ Mode auto : désinscription de ${targets.length} expéditeur(s)...`);
+    dbg(`Auto mode : ${targets.length} groupes ciblés`);
 
-    for (const r of (resp.responses || [])) {
-      const entry = chunk[parseInt(r.id)];
-      if (!entry) continue;
-      const status = r.status;
-      statusCounts[status] = (statusCounts[status] || 0) + 1;
+    // === Phase 0 : résoudre la corbeille AVANT les unsubs ===
+    // Si on échoue ici, pas la peine d'unsubscribe — on saurait pas où mettre les mails.
+    // Avant ce fix, getDeletedItemsFolder était APRÈS Phase 1 : si throw, on avait déjà
+    // désinscrit mais zéro trace ni suppression, et l'user ne savait pas.
+    phaseReached = "resolving_trash";
+    try {
+      trash = await getDeletedItemsFolder(token);
+    } catch (e) {
+      errored = `trash_resolve_fail: ${e.message}`;
+      dbg(`Auto mode : impossible de résoudre corbeille — ${e.message}`, "err");
+      setStatus(`❌ Impossible de résoudre le dossier corbeille : ${e.message}`);
+      // Cohérence avec les autres failure paths qui émettent un event 'error' dédié.
+      // Le finally émettra aussi auto_mode_run avec errored populé.
+      track("error", { stage: "auto_mode_run", phase: "resolving_trash", message: (e.message || "").substring(0, 200) });
+      return;
+    }
 
-      // Succès : tout 2xx — Graph /move renvoie 200, 201 ou 204 selon le tenant.
-      // Si body présent on confirme avec parentFolderId, sinon on fait confiance au status.
-      if (status >= 200 && status < 300) {
-        if (!r.body || !r.body.parentFolderId || r.body.parentFolderId === trash.id) {
-          deletedIds.add(entry.email.id);
-        } else {
-          dbg(`Auto delete : ${entry.email.id.substring(0,12)}… ${status} OK mais parentFolderId mismatch (${r.body.parentFolderId?.substring(0,24) || "?"})`, "warn");
+    // === Phase 1 : désinscriptions en parallèle avec timeout per-promise ===
+    // Promise.allSettled au lieu de Promise.all → un fetch qui pend ne bloque plus
+    // les 37 autres. Chaque promise est aussi wrappée dans Promise.race avec
+    // un timeout 15s (au cas où la propre timeout interne du fetch ne fire pas).
+    // Sans ce fix, le scan d'OBR le 02/06 a hang indéfiniment sur un unsub URL mort
+    // → aucun auto_mode_run émis, aucune trace.
+    phaseReached = "phase1_unsub";
+    const PER_UNSUB_TIMEOUT_MS = 15000;
+    const unsubResults = await Promise.allSettled(targets.map(async g => {
+      // setTimeout handle exposé pour qu'on puisse le clearer une fois que work() finit
+      // → évite jusqu'à N timers dormants par run quand les unsubs sont rapides.
+      let timeoutHandle = null;
+      const timeoutP = new Promise(resolve => {
+        timeoutHandle = setTimeout(() => resolve({ success: false, reason: "timeout" }), PER_UNSUB_TIMEOUT_MS);
+      });
+      const work = (async () => {
+        try {
+          if (g.info.method === "one-click" && g.info.oneClickUrl) {
+            return await postOneClickUnsubscribe(g.info.oneClickUrl);
+          }
+          if (g.info.method === "graph-mailto" && g.emails[0]?.id) {
+            await callGraph(
+              `https://graph.microsoft.com/beta/me/messages/${g.emails[0].id}/unsubscribe`,
+              "POST", null, token
+            );
+            return { success: true };
+          }
+          if (g.info.method === "http-auto" && g.info.httpsUrl) {
+            return await silentGetUnsubscribe(g.info.httpsUrl);
+          }
+          // popup ou null : pas automatisable, on saute (mais on supprime quand même en Phase 2)
+          return { success: false, reason: "no_method" };
+        } catch (e) {
+          dbg(`Auto unsub ${g.sender}: ${e.message}`, "warn");
+          const reason = /timeout/i.test(e.message) ? "timeout" :
+                         /429|throttl/i.test(e.message) ? "throttled" :
+                         /network|fetch/i.test(e.message) ? "network" : "other";
+          return { success: false, reason };
         }
-        continue;
+      })();
+      return Promise.race([work, timeoutP]).finally(() => {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+      });
+    }));
+
+    for (const r of unsubResults) {
+      const v = r.status === "fulfilled" ? r.value : { success: false, reason: "other" };
+      if (v && v.success) {
+        unsubOk++;
+      } else {
+        unsubFailed++;
+        const k = (v && v.reason) || "other";
+        if (unsubFailReasons[k] !== undefined) unsubFailReasons[k]++;
+        else unsubFailReasons.other++;
+      }
+    }
+
+    // === Phase 2 : suppression des emails Junk via $batch ===
+    phaseReached = "phase2_delete";
+    for (const g of targets) {
+      for (const e of g.emails) if (e.folder === "junk") junkEmails.push({ groupRef: g, email: e });
+    }
+
+    setStatus(`⚡ Auto : ${unsubOk}/${targets.length} désinscrits · suppression de ${junkEmails.length} email(s)...`);
+
+    // Throttling Microsoft Graph : sur certains tenants (Mantu observé fin mai 2026)
+    // /move déclenche du 429 par sub-response au-delà de ~12 moves/seconde par mailbox.
+    // callGraph retry le $batch extérieur mais PAS les sub-responses 429 internes —
+    // elles tombaient silencieusement avant. On gère ça en deux temps :
+    //  1. CONCURRENCY=1 par défaut (60 moves parallèles trop pour tenants stricts)
+    //  2. Retry des sub-responses 429/502/503/504 avec Retry-After (RFC 7231 §7.1.3)
+    const BATCH = 20, CONCURRENCY = 1, MAX_SUB_RETRIES = 3;
+    const allBatches = [];
+    for (let i = 0; i < junkEmails.length; i += BATCH) allBatches.push(junkEmails.slice(i, i + BATCH));
+
+    // Une vague = un ou plusieurs batches de 20 traités en parallèle.
+    // À l'intérieur d'un batch, on retry individuellement les sub-responses 429/5xx.
+    // Si le batch entier throw (callGraph timeout / 5xx final), on retry le chunk
+    // complet jusqu'à MAX_SUB_RETRIES — avant ce fix on perdait 20 emails d'un coup.
+    async function processBatch(chunk, retryAttempt = 0) {
+      const requests = chunk.map((entry, idx) => ({
+        id: String(idx),
+        method: "POST",
+        url: `/me/messages/${entry.email.id}/move`,
+        body: { destinationId: trash.id },
+        headers: { "Content-Type": "application/json" }
+      }));
+      let resp;
+      try {
+        resp = await callGraph("https://graph.microsoft.com/v1.0/$batch", "POST", { requests }, token);
+      } catch (e) {
+        dbg(`Auto batch delete (network/throw): ${e.message}`, "err");
+        track("error", { stage: "auto_delete_batch", message: (e.message || "").substring(0, 200) });
+        // Retry tout le chunk si on a encore des tentatives — un timeout ou 5xx final
+        // ne doit pas perdre 20 emails silencieusement.
+        if (retryAttempt < MAX_SUB_RETRIES) {
+          const waitMs = 1000 * Math.pow(2, retryAttempt);
+          dbg(`Auto batch delete : retry tout le chunk dans ${waitMs}ms (tentative ${retryAttempt + 1}/${MAX_SUB_RETRIES})`, "warn");
+          await new Promise(r => setTimeout(r, waitMs));
+          await processBatch(chunk, retryAttempt + 1);
+          return;
+        }
+        // Échec définitif après MAX_SUB_RETRIES : on synthétise un status dans statusCounts
+        // pour qu'auto_mode_run.delete_throttled/4xx/5xx ne soit pas à zéro alors que tout
+        // le chunk a échoué. Permet aux dashboards PostHog de catégoriser correctement.
+        // 599 = code non-standard pour "network timeout" (utilisé par certaines stacks),
+        // 502 = bad gateway pour les erreurs Graph propagées.
+        const syntheticStatus = /timeout/i.test(e.message) ? 599 : 502;
+        statusCounts[syntheticStatus] = (statusCounts[syntheticStatus] || 0) + chunk.length;
+        return;
       }
 
-      // Throttling : 429 (Too Many Requests) ou 503 (Service Unavailable) → retry.
-      // Microsoft Graph honore Retry-After ; on le lit dans r.headers si présent.
-      if ((status === 429 || status === 503) && retryAttempt < MAX_SUB_RETRIES) {
-        const ra = parseInt(r.headers?.["Retry-After"] || r.headers?.["retry-after"] || "0", 10);
-        if (ra > maxRetryAfterSec) maxRetryAfterSec = ra;
-        toRetry.push(entry);
-        continue;
+      const toRetry = []; // entries à retenter (429/5xx sub-responses)
+      let maxRetryAfterSec = 0;
+
+      for (const r of (resp.responses || [])) {
+        const entry = chunk[parseInt(r.id)];
+        if (!entry) continue;
+        const status = r.status;
+        statusCounts[status] = (statusCounts[status] || 0) + 1;
+
+        // Succès : tout 2xx — Graph /move renvoie 200, 201 ou 204 selon le tenant.
+        // Si body présent on confirme avec parentFolderId, sinon on fait confiance au status.
+        if (status >= 200 && status < 300) {
+          if (!r.body || !r.body.parentFolderId || r.body.parentFolderId === trash.id) {
+            deletedIds.add(entry.email.id);
+          } else {
+            dbg(`Auto delete : ${entry.email.id.substring(0,12)}… ${status} OK mais parentFolderId mismatch (${r.body.parentFolderId?.substring(0,24) || "?"})`, "warn");
+          }
+          continue;
+        }
+
+        // Erreurs transientes : 429 throttling, 502/503/504 erreurs serveur → retry.
+        // Microsoft Graph honore Retry-After ; on le lit dans r.headers si présent.
+        // Cap à 10s pour ne pas bloquer 5min sur un Retry-After absurde.
+        if ((status === 429 || status === 502 || status === 503 || status === 504) && retryAttempt < MAX_SUB_RETRIES) {
+          const raRaw = parseInt(r.headers?.["Retry-After"] || r.headers?.["retry-after"] || "0", 10);
+          const ra = Math.min(raRaw, 10);
+          if (ra > maxRetryAfterSec) maxRetryAfterSec = ra;
+          toRetry.push(entry);
+          continue;
+        }
+
+        // Échec définitif : log + on passe au suivant (sera visible au prochain scan).
+        const errMsg = r.body?.error?.message || r.body?.error?.code || "(no detail)";
+        dbg(`Auto delete FAIL ${status} : ${entry.email.id.substring(0,12)}… — ${errMsg}`, "err");
       }
 
-      // Échec définitif : log + on passe au suivant (sera visible au prochain scan).
-      const errMsg = r.body?.error?.message || r.body?.error?.code || "(no detail)";
-      dbg(`Auto delete FAIL ${status} : ${entry.email.id.substring(0,12)}… — ${errMsg}`, "err");
+      // Retry du sous-batch des 429/5xx. Backoff = max(Retry-After capé, exponentiel).
+      if (toRetry.length > 0) {
+        const waitMs = Math.max(maxRetryAfterSec * 1000, 1000 * Math.pow(2, retryAttempt));
+        dbg(`Auto delete : ${toRetry.length} sub-response(s) en 429/5xx, retry dans ${waitMs}ms (tentative ${retryAttempt + 1}/${MAX_SUB_RETRIES})`, "warn");
+        await new Promise(r => setTimeout(r, waitMs));
+        await processBatch(toRetry, retryAttempt + 1);
+      }
     }
 
-    // Retry du sous-batch des 429/503. Backoff = max(Retry-After, exponentiel sur tentative).
-    if (toRetry.length > 0) {
-      const waitMs = Math.max(maxRetryAfterSec * 1000, 1000 * Math.pow(2, retryAttempt));
-      dbg(`Auto delete : ${toRetry.length} sub-response(s) en 429/503, retry dans ${waitMs}ms (tentative ${retryAttempt + 1}/${MAX_SUB_RETRIES})`, "warn");
-      await new Promise(r => setTimeout(r, waitMs));
-      await processBatch(toRetry, retryAttempt + 1);
+    for (let i = 0; i < allBatches.length; i += CONCURRENCY) {
+      const wave = allBatches.slice(i, i + CONCURRENCY);
+      await Promise.all(wave.map(chunk => processBatch(chunk)));
     }
-  }
 
-  for (let i = 0; i < allBatches.length; i += CONCURRENCY) {
-    const wave = allBatches.slice(i, i + CONCURRENCY);
-    await Promise.all(wave.map(chunk => processBatch(chunk)));
-  }
+    // Distribution des status finaux dans les logs (utile pour confirmer/infirmer le throttling).
+    const statusSummary = Object.entries(statusCounts)
+      .sort(([a], [b]) => parseInt(a) - parseInt(b))
+      .map(([s, n]) => `${s}:${n}`)
+      .join(", ");
+    if (statusSummary) dbg(`Auto delete status distribution : ${statusSummary}`, "info");
 
-  // Distribution des status finaux dans les logs (utile pour confirmer/infirmer le throttling).
-  const statusSummary = Object.entries(statusCounts)
-    .sort(([a], [b]) => parseInt(a) - parseInt(b))
-    .map(([s, n]) => `${s}:${n}`)
-    .join(", ");
-  if (statusSummary) dbg(`Auto delete status distribution : ${statusSummary}`, "info");
-
-  // === Phase 3 : update state & re-render ===
-  // Groupe entièrement vidé (folders={junk}) → on retire du tableau.
-  // Groupe mixte (folders={junk,inbox}) → on retire les emails Junk supprimés, on garde le reste.
-  for (const g of targets) {
-    const surviving = g.emails.filter(e => !deletedIds.has(e.id));
-    if (surviving.length === 0) {
-      const idx = groups.indexOf(g);
-      if (idx !== -1) groups[idx] = null;
-    } else {
-      g.emails = surviving;
-      g.folders = new Set(surviving.map(e => e.folder));
-      g.unsubDone = true;
-      g.unsubDoneLabel = "⚡ Auto traité";
+    // === Phase 3 : update state & re-render ===
+    // Groupe entièrement vidé (folders={junk}) → on retire du tableau.
+    // Groupe mixte (folders={junk,inbox}) → on retire les emails Junk supprimés, on garde le reste.
+    phaseReached = "phase3_render";
+    for (const g of targets) {
+      const surviving = g.emails.filter(e => !deletedIds.has(e.id));
+      if (surviving.length === 0) {
+        const idx = groups.indexOf(g);
+        if (idx !== -1) groups[idx] = null;
+      } else {
+        g.emails = surviving;
+        g.folders = new Set(surviving.map(e => e.folder));
+        g.unsubDone = true;
+        g.unsubDoneLabel = "⚡ Auto traité";
+      }
     }
-  }
-  renderResults();
-  if (groups.filter(Boolean).length === 0) {
-    document.getElementById("results-container").classList.add("hidden");
-  }
+    renderResults();
+    if (groups.filter(Boolean).length === 0) {
+      document.getElementById("results-container").classList.add("hidden");
+    }
 
-  const failedUnsub = targets.length - unsubOk;
-  const failedDelete = junkEmails.length - deletedIds.size;
-  let msg = `⚡ Auto terminé : ${unsubOk}/${targets.length} désinscrits, ${deletedIds.size}/${junkEmails.length} email(s) → "${trash.displayName}"`;
-  if (failedUnsub > 0) msg += ` · ${failedUnsub} unsub non auto (popup)`;
-  if (failedDelete > 0) msg += ` · ${failedDelete} suppression(s) en échec`;
-  setStatus(msg);
-  dbg(`Auto terminé : ${unsubOk}/${targets.length} unsub, ${deletedIds.size}/${junkEmails.length} delete`, "ok");
-  // Agrégat des status par classe pour analyse PostHog (compteurs uniquement, jamais d'ID).
-  // delete_throttled = 429 final après tous les retries. delete_4xx = autres erreurs client
-  // (404 si l'email a été déplacé entre-temps, 403 si plus de droits, etc.). delete_5xx = erreurs serveur.
-  let throttled = 0, errors4xx = 0, errors5xx = 0;
-  for (const [statusStr, n] of Object.entries(statusCounts)) {
-    const s = parseInt(statusStr, 10);
-    if (s === 429) throttled += n;
-    else if (s >= 400 && s < 500) errors4xx += n;
-    else if (s >= 500) errors5xx += n;
+    const failedDelete = junkEmails.length - deletedIds.size;
+    let msg = `⚡ Auto terminé : ${unsubOk}/${targets.length} désinscrits, ${deletedIds.size}/${junkEmails.length} email(s) → "${trash.displayName}"`;
+    if (unsubFailed > 0) msg += ` · ${unsubFailed} unsub non auto`;
+    if (failedDelete > 0) msg += ` · ${failedDelete} suppression(s) en échec`;
+    setStatus(msg);
+    dbg(`Auto terminé : ${unsubOk}/${targets.length} unsub, ${deletedIds.size}/${junkEmails.length} delete`, "ok");
+    phaseReached = "completed";
+  } catch (e) {
+    errored = e.message || String(e);
+    dbg(`Auto mode ERREUR (phase=${phaseReached}): ${errored}`, "err");
+    track("error", { stage: "auto_mode_run", phase: phaseReached, message: (errored || "").substring(0, 200) });
+  } finally {
+    // GARANTI : auto_mode_run est toujours émis, peu importe ce qui s'est passé.
+    // Avant ce fix, un throw ou un hang en Phase 1/2 = zéro event = aucune visibilité.
+    // Maintenant on émet AU MOINS la phase atteinte et le compte avant le crash.
+    let throttled = 0, errors4xx = 0, errors5xx = 0;
+    for (const [statusStr, n] of Object.entries(statusCounts)) {
+      const s = parseInt(statusStr, 10);
+      if (s === 429) throttled += n;
+      else if (s >= 400 && s < 500) errors4xx += n;
+      else if (s >= 500) errors5xx += n;
+    }
+    const failedDelete = junkEmails.length - deletedIds.size;
+    track("auto_mode_run", {
+      targets: targets.length,
+      unsub_ok: unsubOk,
+      unsub_failed: unsubFailed,
+      unsub_failed_timeout: unsubFailReasons.timeout,
+      unsub_failed_throttled: unsubFailReasons.throttled,
+      unsub_failed_network: unsubFailReasons.network,
+      unsub_failed_no_method: unsubFailReasons.no_method,
+      unsub_failed_other: unsubFailReasons.other,
+      emails_targeted: junkEmails.length,
+      emails_deleted: deletedIds.size,
+      delete_failed: failedDelete,
+      delete_throttled: throttled,
+      delete_4xx: errors4xx,
+      delete_5xx: errors5xx,
+      phase_reached: phaseReached,
+      errored: errored || null,
+      duration_ms: Date.now() - autoStartTs
+    });
   }
-  track("auto_mode_run", {
-    targets: targets.length,
-    unsub_ok: unsubOk,
-    unsub_failed: failedUnsub,
-    emails_targeted: junkEmails.length,
-    emails_deleted: deletedIds.size,
-    delete_failed: failedDelete,
-    delete_throttled: throttled,
-    delete_4xx: errors4xx,
-    delete_5xx: errors5xx,
-    duration_ms: Date.now() - autoStartTs
-  });
 }
 
 // ============================================================
@@ -2200,6 +2332,19 @@ document.getElementById("btn-scan").addEventListener("click", async () => {
 
     if (active.length === 0) {
       setStatus(`✅ Aucune newsletter trouvée dans les ${totalScanned} derniers emails.`);
+      // Si l'auto-mode était activé pour le Junk mais qu'il n'y a rien à traiter,
+      // on émet quand même un auto_mode_run "no_active_groups" pour avoir une trace
+      // dans PostHog. Avant ce fix, on retournait sans rien tracker → faux positif
+      // "auto-mode jamais déclenché" quand en réalité il n'y avait juste rien à faire.
+      if (autoOn && scanJunk) {
+        track("auto_mode_run", {
+          targets: 0,
+          unsub_ok: 0, unsub_failed: 0,
+          emails_targeted: 0, emails_deleted: 0, delete_failed: 0,
+          phase_reached: "no_active_groups",
+          duration_ms: 0
+        });
+      }
       btn.disabled = false;
       return;
     }
@@ -2367,14 +2512,14 @@ async function executeUnsubscribe(idx, cardEl, unsubBtn, deleteBtn) {
     // --- Méthode 1 : RFC 8058 one-click POST ---
     if (info.method === "one-click" && info.oneClickUrl) {
       dbg(`One-click POST → ${info.oneClickUrl}`);
-      const ok = await postOneClickUnsubscribe(info.oneClickUrl);
-      if (ok) {
+      const res = await postOneClickUnsubscribe(info.oneClickUrl);
+      if (res && res.success) {
         markCardSuccess(cardEl, unsubBtn, `✅ Désinscrit`);
         setStatus(`✅ ${group.sender} : désinscription one-click envoyée. Clique 🗑️ Supprimer pour jeter les ${group.emails.length} email(s).`);
         track("unsub_executed", { method: "one-click", success: true, source: info.source, bulk: false });
         return;
       }
-      dbg(`One-click POST échoué, fallback GET silencieux`, "warn");
+      dbg(`One-click POST échoué (${res?.reason || "unknown"}), fallback GET silencieux`, "warn");
     }
 
     // --- Méthode 2 : Graph /unsubscribe (mailto) ---
@@ -2402,15 +2547,15 @@ async function executeUnsubscribe(idx, cardEl, unsubBtn, deleteBtn) {
     const httpUrl = info.httpsUrl || info.oneClickUrl;
     if (httpUrl) {
       dbg(`GET silencieux → ${httpUrl}`);
-      const ok = await silentGetUnsubscribe(httpUrl);
-      if (ok) {
+      const res = await silentGetUnsubscribe(httpUrl);
+      if (res && res.success) {
         markCardSuccess(cardEl, unsubBtn, `✅ Désinscrit`);
         const src = info.source === "body" ? " (lien trouvé dans le corps)" : "";
         setStatus(`✅ ${group.sender}${src} : désinscription envoyée. Clique 🗑️ Supprimer pour jeter les ${group.emails.length} email(s).`);
         track("unsub_executed", { method: "http-auto", success: true, source: info.source, bulk: false });
         return;
       }
-      dbg(`GET silencieux échoué — fallback popup`, "warn");
+      dbg(`GET silencieux échoué (${res?.reason || "unknown"}) — fallback popup`, "warn");
     }
 
     // --- Méthode 4 : popup (ultime recours, rien d'auto possible) ---
@@ -2439,21 +2584,27 @@ async function executeUnsubscribe(idx, cardEl, unsubBtn, deleteBtn) {
 
 // POST one-click RFC 8058. no-cors → réponse opaque, on ne peut pas lire le statut.
 // Retourne true tant que le fetch ne throw pas (pas d'erreur DNS/TLS).
+// Timeout 8s sur les fetch d'unsub : sans ça un host de désinscription mort fige
+// indéfiniment Promise.all en Phase 1, ce qui faisait crasher silencieusement
+// l'auto-mode chez OBR (02/06 — 38 targets, scan_completed firé mais auto_mode_run
+// jamais émis car un fetch pendait). Au pire on perd quelques unsubs lents, mais
+// on ne bloque plus le reste de la phase. Le sender réapparaîtra au prochain scan.
 async function postOneClickUnsubscribe(url) {
   try {
-    await fetch(url, {
+    await fetchWithTimeout(url, {
       method: "POST",
       mode: "no-cors",
       credentials: "omit",
       referrerPolicy: "no-referrer",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: "List-Unsubscribe=One-Click"
-    });
+    }, 8000);
     dbg(`One-click POST envoyé (no-cors, opaque)`, "ok");
-    return true;
+    return { success: true };
   } catch (e) {
-    dbg(`One-click POST erreur réseau: ${e.message}`, "err");
-    return false;
+    const reason = /timeout/i.test(e.message) ? "timeout" : "network";
+    dbg(`One-click POST ${reason}: ${e.message}`, "err");
+    return { success: false, reason };
   }
 }
 
@@ -2465,17 +2616,18 @@ async function postOneClickUnsubscribe(url) {
 // au prochain scan — l'user refera l'action.
 async function silentGetUnsubscribe(url) {
   try {
-    await fetch(url, {
+    await fetchWithTimeout(url, {
       method: "GET",
       mode: "no-cors",
       credentials: "omit",
       referrerPolicy: "no-referrer"
-    });
+    }, 8000);
     dbg(`GET silencieux envoyé (no-cors, opaque)`, "ok");
-    return true;
+    return { success: true };
   } catch (e) {
-    dbg(`GET silencieux erreur réseau: ${e.message}`, "err");
-    return false;
+    const reason = /timeout/i.test(e.message) ? "timeout" : "network";
+    dbg(`GET silencieux ${reason}: ${e.message}`, "err");
+    return { success: false, reason };
   }
 }
 
@@ -2683,34 +2835,46 @@ document.getElementById("btn-unsub-bulk").addEventListener("click", async () => 
   // --- 1-clic RFC 8058 en parallèle ---
   if (oneClickIdx.length > 0) {
     btn.textContent = `⏳ 1-clic (${oneClickIdx.length})…`;
-    const results = await Promise.all(oneClickIdx.map(i =>
+    const results = await Promise.allSettled(oneClickIdx.map(i =>
       postOneClickUnsubscribe(groups[i].info.oneClickUrl).then(r => ({ i, r }))
     ));
-    for (const { i, r } of results) {
-      if (r) {
+    for (const settled of results) {
+      const v = settled.status === "fulfilled" ? settled.value : null;
+      const i = v?.i;
+      const r = v?.r;
+      const success = !!(r && r.success);
+      if (success) {
         ok++;
         const card = document.querySelector(`.group-item[data-idx="${i}"]`);
         const unsubBtn = card?.querySelector(".btn-sm.unsub");
         if (card && unsubBtn) markCardSuccess(card, unsubBtn, `✅ Désinscrit`);
       } else { errors++; }
-      track("unsub_executed", { method: "one-click", success: !!r, source: groups[i]?.info.source, bulk: true });
+      if (i !== undefined) {
+        track("unsub_executed", { method: "one-click", success, reason: r?.reason, source: groups[i]?.info.source, bulk: true });
+      }
     }
   }
 
   // --- GET silencieux en parallèle (headers sans RFC 8058 + liens body) ---
   if (httpAutoIdx.length > 0) {
     btn.textContent = `⏳ GET silencieux (${httpAutoIdx.length})…`;
-    const results = await Promise.all(httpAutoIdx.map(i =>
+    const results = await Promise.allSettled(httpAutoIdx.map(i =>
       silentGetUnsubscribe(groups[i].info.httpsUrl).then(r => ({ i, r }))
     ));
-    for (const { i, r } of results) {
-      if (r) {
+    for (const settled of results) {
+      const v = settled.status === "fulfilled" ? settled.value : null;
+      const i = v?.i;
+      const r = v?.r;
+      const success = !!(r && r.success);
+      if (success) {
         ok++;
         const card = document.querySelector(`.group-item[data-idx="${i}"]`);
         const unsubBtn = card?.querySelector(".btn-sm.unsub");
         if (card && unsubBtn) markCardSuccess(card, unsubBtn, `✅ Désinscrit`);
       } else { errors++; }
-      track("unsub_executed", { method: "http-auto", success: !!r, source: groups[i]?.info.source, bulk: true });
+      if (i !== undefined) {
+        track("unsub_executed", { method: "http-auto", success, reason: r?.reason, source: groups[i]?.info.source, bulk: true });
+      }
     }
   }
 
