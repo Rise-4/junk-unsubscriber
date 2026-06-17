@@ -341,7 +341,7 @@ function renderTraceTable() {
 // Capture événements d'usage anonymisés : compteurs, durées, méthodes.
 // Aucun contenu d'email, expéditeur ou URL n'est envoyé. Identifiant = email Office,
 // tenant dérivé du domaine pour breakdown Rise / Mantu / DXC dans les dashboards.
-const APP_VERSION = "1.0.0.10";
+const APP_VERSION = "1.0.0.11";
 
 function track(event, props) {
   try {
@@ -477,7 +477,14 @@ async function initMsal() {
   }
 }
 
-async function getToken() {
+// opts.silentOnly : interdit TOUTE interaction (popup/redirect). Indispensable
+// pendant une opération en masse (suppression bulk) : un acquireTokenRedirect
+// navigue tout le taskpane vers login puis le RECHARGE (via auth-redirect.html),
+// ce qui détruit la boucle en cours → cause racine du crash "supprime 1/3 puis
+// le panneau se ferme". En silentOnly on remonte une erreur typée que le caller
+// gère proprement (stop + message), sans jamais quitter la page.
+async function getToken(opts = {}) {
+  const silentOnly = opts.silentOnly === true;
   if (!msalReady) {
     await initMsal();
     if (!msalReady) throw new Error("MSAL non initialisé");
@@ -501,6 +508,13 @@ async function getToken() {
     } catch (e) { dbg(`Silent échoué: ${e.message}`, "warn"); }
   } else if (accounts.length > 0 && currentMailbox) {
     dbg(`Comptes en cache (${accounts.map(a => a.username).join(", ")}) ne matchent pas ${currentMailbox} — popup forcée`, "warn");
+  }
+
+  // En silentOnly on ne descend JAMAIS vers popup/redirect : on coupe ici.
+  if (silentOnly) {
+    const err = new Error("Session expirée — clique « Scanner » pour te reconnecter, puis réessaie.");
+    err.name = "InteractionRequiredError";
+    throw err;
   }
 
   try {
@@ -2703,7 +2717,97 @@ function markCardNeutral(cardEl, unsubBtn, label) {
 // parentFolderId qu'on VÉRIFIE pour confirmer qu'il a bien atterri. Le client
 // Outlook peut prendre 5-60s pour synchroniser — la confirmation Graph est
 // immédiate et fiable (source de vérité côté Microsoft).
-async function deleteGroup(idx, cardEl, deleteBtn, bulk = false) {
+// Déplace une liste d'emails vers la corbeille via Graph $batch (20/lot,
+// CONCURRENCY=1), avec retry par sous-réponse 429/5xx ET retry du chunk entier.
+// MÊME logique robuste que le mode Auto (Phase 2) — extraite ici pour que la
+// suppression manuelle en bénéficie au lieu de déplacer les mails un par un
+// (l'ancienne boucle séquentielle ouvrait une longue fenêtre de risque pendant
+// laquelle un refresh de token MSAL pouvait recharger le taskpane).
+// Retourne { deletedIds:Set<id>, statusCounts:Object }.
+async function moveEmailsToTrash(emails, trash, token) {
+  const BATCH = 20, CONCURRENCY = 1, MAX_SUB_RETRIES = 3;
+  const deletedIds = new Set();
+  const statusCounts = {};
+  const allBatches = [];
+  for (let i = 0; i < emails.length; i += BATCH) allBatches.push(emails.slice(i, i + BATCH));
+
+  async function processBatch(chunk, retryAttempt = 0) {
+    const requests = chunk.map((email, idx) => ({
+      id: String(idx),
+      method: "POST",
+      url: `/me/messages/${email.id}/move`,
+      body: { destinationId: trash.id },
+      headers: { "Content-Type": "application/json" }
+    }));
+    let resp;
+    try {
+      resp = await callGraph("https://graph.microsoft.com/v1.0/$batch", "POST", { requests }, token);
+    } catch (e) {
+      dbg(`Bulk delete batch (network/throw): ${e.message}`, "err");
+      track("error", { stage: "delete_batch", message: (e.message || "").substring(0, 200) });
+      // Retry tout le chunk : un timeout/5xx final ne doit pas perdre 20 emails.
+      if (retryAttempt < MAX_SUB_RETRIES) {
+        const waitMs = 1000 * Math.pow(2, retryAttempt);
+        dbg(`Bulk delete : retry du chunk dans ${waitMs}ms (tentative ${retryAttempt + 1}/${MAX_SUB_RETRIES})`, "warn");
+        await new Promise(r => setTimeout(r, waitMs));
+        await processBatch(chunk, retryAttempt + 1);
+        return;
+      }
+      const syntheticStatus = /timeout/i.test(e.message) ? 599 : 502;
+      statusCounts[syntheticStatus] = (statusCounts[syntheticStatus] || 0) + chunk.length;
+      return;
+    }
+
+    const toRetry = [];
+    let maxRetryAfterSec = 0;
+    for (const r of (resp.responses || [])) {
+      const email = chunk[parseInt(r.id)];
+      if (!email) continue;
+      const status = r.status;
+      statusCounts[status] = (statusCounts[status] || 0) + 1;
+
+      // Succès : tout 2xx (Graph /move renvoie 200/201/204 selon le tenant).
+      if (status >= 200 && status < 300) {
+        if (!r.body || !r.body.parentFolderId || r.body.parentFolderId === trash.id) {
+          deletedIds.add(email.id);
+        } else {
+          dbg(`Bulk delete : ${email.id.substring(0,12)}… ${status} OK mais parentFolderId mismatch (${r.body.parentFolderId?.substring(0,24) || "?"})`, "warn");
+        }
+        continue;
+      }
+
+      // Transitoires : 429/502/503/504 → retry de la sous-réponse.
+      if ((status === 429 || status === 502 || status === 503 || status === 504) && retryAttempt < MAX_SUB_RETRIES) {
+        const raRaw = parseInt(r.headers?.["Retry-After"] || r.headers?.["retry-after"] || "0", 10);
+        const ra = Math.min(raRaw, 10);
+        if (ra > maxRetryAfterSec) maxRetryAfterSec = ra;
+        toRetry.push(email);
+        continue;
+      }
+
+      const errMsg = r.body?.error?.message || r.body?.error?.code || "(no detail)";
+      dbg(`Bulk delete FAIL ${status} : ${email.id.substring(0,12)}… — ${errMsg}`, "err");
+    }
+
+    if (toRetry.length > 0) {
+      const waitMs = Math.max(maxRetryAfterSec * 1000, 1000 * Math.pow(2, retryAttempt));
+      dbg(`Bulk delete : ${toRetry.length} sous-réponse(s) 429/5xx, retry dans ${waitMs}ms (tentative ${retryAttempt + 1}/${MAX_SUB_RETRIES})`, "warn");
+      await new Promise(r => setTimeout(r, waitMs));
+      await processBatch(toRetry, retryAttempt + 1);
+    }
+  }
+
+  for (let i = 0; i < allBatches.length; i += CONCURRENCY) {
+    const wave = allBatches.slice(i, i + CONCURRENCY);
+    await Promise.all(wave.map(chunk => processBatch(chunk)));
+  }
+  return { deletedIds, statusCounts };
+}
+
+// sharedToken : en bulk, le token est acquis UNE fois par le handler et passé
+// ici — plus aucun getToken() par groupe, donc plus de cascade
+// silent→popup→redirect qui rechargeait le taskpane en pleine suppression.
+async function deleteGroup(idx, cardEl, deleteBtn, bulk = false, sharedToken = null) {
   const group = groups[idx];
   if (!group) return;
 
@@ -2712,66 +2816,28 @@ async function deleteGroup(idx, cardEl, deleteBtn, bulk = false) {
   const initialCount = group.emails.length;
 
   try {
-    const token = await getToken();
+    // En bulk sans token fourni (ne devrait pas arriver), on force silentOnly
+    // pour ne JAMAIS déclencher de redirect au milieu d'une opération.
+    const token = sharedToken || await getToken({ silentOnly: bulk });
     if (!token) { deleteBtn.disabled = false; deleteBtn.textContent = `🗑️ Supprimer (${group.emails.length})`; return; }
 
     const trash = await getDeletedItemsFolder(token);
-    let ok = 0, confirmed = 0, errors = 0;
-    const movedSubjects = [];
-    for (const email of group.emails) {
-      try {
-        // Utilise l'ID résolu (plus fiable que le nom magique "deleteditems" sur certains tenants)
-        const moved = await callGraph(
-          `https://graph.microsoft.com/v1.0/me/messages/${email.id}/move`,
-          "POST", { destinationId: trash.id }, token
-        );
-        ok++;
-        if (moved && moved.parentFolderId === trash.id) {
-          confirmed++;
-          movedSubjects.push(email.subject);
-          dbg(`${email.folder} → ${trash.displayName} ✓ : "${email.subject}"`, "ok");
-        } else {
-          dbg(`⚠️ Move OK mais parentFolderId=${moved?.parentFolderId?.substring(0,24) || "?"} (attendu ${trash.id.substring(0,24)})`, "warn");
-        }
-      } catch (e) {
-        errors++;
-        dbg(`Erreur suppression ${email.id}: ${e.message}`, "err");
-      }
-    }
 
-    // Sonde post-move : liste les 5 derniers messages du dossier corbeille pour
-    // PROUVER que les emails y sont (côté Graph, serveur Microsoft).
-    // Si Outlook client n'affiche pas, c'est un pur problème de sync → Ctrl+F5.
-    if (confirmed > 0) {
-      try {
-        const probe = await callGraph(
-          `https://graph.microsoft.com/v1.0/me/mailFolders/${trash.id}/messages?$top=5&$select=id,subject,lastModifiedDateTime&$orderby=lastModifiedDateTime desc`,
-          "GET", null, token
-        );
-        const items = probe.value || [];
-        dbg(`📋 Sonde "${trash.displayName}" — 5 plus récents :`, "info");
-        const movedSet = new Set(movedSubjects);
-        let foundCount = 0;
-        for (const it of items) {
-          const here = movedSet.has(it.subject) ? "  ← VIENT D'ÊTRE DÉPLACÉ" : "";
-          if (here) foundCount++;
-          const ts = new Date(it.lastModifiedDateTime).toLocaleTimeString("fr-FR");
-          dbg(`   [${ts}] "${it.subject}"${here}`);
-        }
-        dbg(`📋 Preuve : ${foundCount}/${confirmed} emails déplacés retrouvés dans "${trash.displayName}"`, foundCount === confirmed ? "ok" : "warn");
-      } catch (e) {
-        dbg(`Sonde corbeille : ${e.message}`, "warn");
-      }
-    }
+    // Suppression via $batch robuste (retry 429/5xx) au lieu d'un move par mail.
+    const { deletedIds, statusCounts } = await moveEmailsToTrash(group.emails, trash, token);
+    const confirmed = deletedIds.size;
+    const ok = confirmed;
+    const errors = initialCount - confirmed;
+
+    const statusSummary = Object.entries(statusCounts).sort(([a],[b]) => a - b).map(([s,n]) => `${s}:${n}`).join(", ");
+    if (statusSummary) dbg(`Delete status : ${statusSummary}`, "info");
 
     if (errors === 0) {
       groups[idx] = null;
       cardEl.remove();
       updateSummary();
       const allDone = groups.filter(Boolean).length === 0;
-      const baseMsg = confirmed === ok
-        ? `✅ ${ok} email(s) de ${group.sender} → "${trash.displayName}" (Graph confirme). Non visibles dans Outlook ? Ctrl+F5 ou clique ⟳ refresh (le client peut traîner 1 min).`
-        : `✅ ${ok} email(s) déplacés (${confirmed}/${ok} confirmés dans "${trash.displayName}"). Vérifie le debug pour les autres.`;
+      const baseMsg = `✅ ${ok} email(s) de ${group.sender} → "${trash.displayName}". Non visibles dans Outlook ? Ctrl+F5 ou clique ⟳ refresh (le client peut traîner 1 min).`;
       if (allDone) {
         document.getElementById("results-container").classList.add("hidden");
         setStatus(`${baseMsg} Tout traité ! Rescannez pour vérifier.`);
@@ -2781,12 +2847,12 @@ async function deleteGroup(idx, cardEl, deleteBtn, bulk = false) {
     } else {
       deleteBtn.disabled = false;
       deleteBtn.textContent = `🗑️ Supprimer (${group.emails.length})`;
-      setStatus(`⚠️ ${ok} supprimés (${confirmed} confirmés), ${errors} erreur(s). Réessayez.`);
+      setStatus(`⚠️ ${ok}/${initialCount} supprimés, ${errors} en échec. Réessayez.`);
     }
     track("delete_executed", { emails_count: initialCount, success_count: ok, confirmed_count: confirmed, errors, bulk });
   } catch (err) {
     dbg(`ERREUR SUPPRESSION: ${err.message}`, "err");
-    setStatus(`❌ Erreur : ${err.message}`);
+    setStatus(`❌ ${err.message}`);
     deleteBtn.disabled = false;
     deleteBtn.textContent = `🗑️ Supprimer (${group.emails.length})`;
     track("error", { stage: "delete", message: (err.message || "").substring(0, 200) });
@@ -2944,12 +3010,20 @@ document.getElementById("btn-delete-bulk").addEventListener("click", async () =>
     btn.disabled = true;
     btn.textContent = "⏳ Suppression...";
 
+    // Token acquis UNE SEULE FOIS pour toute l'opération (le clic est un geste
+    // utilisateur valide → une éventuelle interaction est OK ICI, avant toute
+    // suppression). Ensuite il est passé à chaque deleteGroup : plus aucun
+    // getToken() par groupe, donc plus de redirect MSAL qui rechargeait le
+    // taskpane en plein milieu (cause racine du "supprime 1/3 puis se ferme").
+    const token = await getToken();
+    if (!token) { btn.disabled = false; btn.textContent = originalLabel; return; }
+
     let done = 0;
     for (const idx of checkedIdx) {
       const card = document.querySelector(`.group-item[data-idx="${idx}"]`);
       const deleteBtn = card?.querySelector(".btn-sm.delete");
       if (!card || !deleteBtn) continue;
-      await deleteGroup(idx, card, deleteBtn, true);
+      await deleteGroup(idx, card, deleteBtn, true, token);
       done++;
       setStatus(`🗑️ Suppression... ${done}/${checkedIdx.length}`);
     }
